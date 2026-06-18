@@ -28,3 +28,6 @@ Thumbs.db
 /challenge-pack/WorkIQ-Architecture-Guide_14-JUN-2026.pdf
 /starter-kit/workiq-agent_14-JUN-2026.mjs
 /starter-kit/workiq-ask-harness_14-JUN-2026.mjs
+
+# Instructor-only material — never publish to participants.
+/instructor/
