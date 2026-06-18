@@ -8,8 +8,8 @@
 # Microsoft Work IQ Hackathon
 
 Everything a team needs to take on a **Work IQ** hackathon challenge — the challenge
-pack, a setup guide, an architecture guide, starter code, and a **local simulator** so
-you can build and test **without a Microsoft 365 tenant**.
+pack, a setup guide, and a **local simulator** so you can build and test **without a
+Microsoft 365 tenant**.
 
 > **Work IQ** grounds answers in your *live work context* — email, meetings, chats,
 > files, people, calendar and Copilot memory — reached over **MCP** and **A2A**.
@@ -20,17 +20,16 @@ you can build and test **without a Microsoft 365 tenant**.
 
 ```
 workiq-hackathon/
-  challenge-pack/     # The 3 PDFs you read first (challenge pack, setup guide, architecture guide)
+  challenge-pack/     # The PDFs you read first (challenge pack + setup guide)
   simulator/          # Local Work IQ simulator — 6 challenge scenarios, MCP + A2A servers, tests
-  starter-kit/        # Drop-in agent + smoke-test scripts (Node .mjs / PowerShell) and an MCP config
+  starter-kit/        # MCP connection smoke-tests and a reference MCP config
   README.md           # You are here
 ```
 
 | Folder | Start here |
 |---|---|
 | `challenge-pack/WorkIQ-Hackathon-Challenge-Pack_14-JUN-2026.pdf` | The 6 challenges, judging criteria, capability tiers. **Read first.** |
-| `challenge-pack/WorkIQ-Hackathon-Participant-Setup-Guide_14-JUN-2026.pdf` | Step-by-step environment setup (real tenant **and** local simulator). |
-| `challenge-pack/WorkIQ-Architecture-Guide_14-JUN-2026.pdf` | How Work IQ works under the hood (for architects / lead devs). |
+| `challenge-pack/WorkIQ-Hackathon-Participant-Setup-Guide_14-JUN-2026.pdf` | Step-by-step environment setup — only needed for **real** Work IQ (Path B). |
 
 ---
 
@@ -96,101 +95,23 @@ contracts.
 
 ---
 
-## Build your agent — Microsoft Agent Framework + a Foundry model
+## Build your agent
 
-This is the **recommended way to build your hackathon agent**: a reasoning LLM hosted in
-**Azure AI Foundry** drives the conversation, and the **Work IQ simulator is wired in as an
-MCP tool** via the **Microsoft Agent Framework**. The model decides when to call
-`ask_work_iq` (and the Tools actions `fetch` / `create_entity` / `update_entity`), reads the
-cited result, and composes the final answer — exercising all four capability tiers,
-including the Tools-write tier.
+The simulator is your Work IQ stand-in. It exposes the **same surface as the real thing**, so
+whatever you build here works unchanged against production Work IQ later:
 
-> This works identically against the real Work IQ MCP server later — you only swap the
-> `command`/`args` of the MCP tool. Your agent code doesn't change.
+- **MCP** — `simulator/server.py` exposes the `ask_work_iq` tool (plus the Tools actions
+  `fetch` / `create_entity` / `update_entity`). Register it like any MCP server.
+- **A2A** — `simulator/a2a_server.py` serves Work IQ as a peer agent (JSON-RPC over HTTP,
+  agent card at `/.well-known/agent-card.json`).
 
-### Prerequisites
+How you turn that into an agent is the challenge. Pick your own LLM, framework, and transport,
+let the model decide when to call Work IQ, and make sure every answer carries the citations the
+tool returns. The tool contract, environment variables, and persona/RBAC behaviour are in
+[`simulator/README.md`](simulator/README.md) — start there.
 
-- Python **3.10+** and the simulator quick start above completed (so `simulator/server.py` runs).
-- An **Azure AI Foundry** project with a **chat model deployed** (e.g. `gpt-4o-mini`).
-- Signed in for Entra auth: `az login`.
-
-### Install
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install agent-framework agent-framework-foundry azure-identity python-dotenv
-```
-
-### Configure (env vars read by `FoundryChatClient`)
-
-```powershell
-$env:FOUNDRY_PROJECT_ENDPOINT = "https://<your-foundry-project>.services.ai.azure.com/api/projects/<project>"
-$env:FOUNDRY_MODEL            = "gpt-4o-mini"   # your deployment name
-```
-
-### Minimal agent (`agent.py`)
-
-```python
-import asyncio, sys
-from agent_framework import Agent, MCPStdioTool
-from agent_framework_foundry import FoundryChatClient
-from azure.identity import AzureCliCredential
-
-SIM_SERVER = r"simulator\server.py"   # the Work IQ simulator MCP server
-
-async def main():
-    workiq = MCPStdioTool(
-        name="workiq",
-        description="Microsoft Work IQ — ask_work_iq + fetch/create_entity/update_entity over your work context.",
-        command=sys.executable,            # the same Python running this agent
-        args=[SIM_SERVER],
-        env={"WORKIQ_SIM_SCENARIO": "scenarios/c2-contoso",
-             "WORKIQ_SIM_PERSONA":  "new_pm"},   # persona drives the RBAC/governance demo
-    )
-
-    async with Agent(
-        client=FoundryChatClient(credential=AzureCliCredential()),  # reads FOUNDRY_* env vars
-        name="WorkIQHackAgent",
-        instructions=(
-            "You are a workplace assistant. Use the Work IQ tools to answer from the user's "
-            "live work context. Always surface the citations the tool returns. When the task "
-            "calls for an action (e.g. logging a milestone or updating a status), call the "
-            "appropriate Tools action and confirm the write."
-        ),
-        tools=workiq,
-    ) as agent:
-        reply = await agent.run("What is blocking qualification, and who owns the test plan?")
-        print(reply.text)
-
-asyncio.run(main())
-```
-
-Run it from the repo root:
-
-```powershell
-.\.venv\Scripts\python.exe agent.py                  # MCP transport (default)
-.\.venv\Scripts\python.exe agent.py --transport a2a  # A2A transport (peer agent)
-.\.venv\Scripts\python.exe agent.py --ask "your own question"
-```
-
-The shipped [`agent.py`](agent.py) is the dual-transport reference: `--transport mcp` (default)
-drives the simulator over `MCPStdioTool`; `--transport a2a` launches `simulator/a2a_server.py`
-and reaches it as a peer via `agent_framework_a2a.A2AAgent` (exposed to the Foundry model with
-`.as_tool()`). Both paths are verified end-to-end against a live Foundry model.
-
-### Notes
-
-- **Foundry vs Azure OpenAI** — to use a model via Azure OpenAI instead of a Foundry project,
-  swap the client for `from agent_framework.openai import OpenAIChatClient` and set
-  `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_CHAT_MODEL` (keep `MCPStdioTool` unchanged).
-- **Switch to the real Work IQ** — replace the tool's `command`/`args` with the real MCP
-  launch (`npx -y @microsoft/workiq@preview mcp start`); everything else stays the same.
-- **A2A instead of MCP** — `agent.py --transport a2a` does this for you; to wire it by hand,
-  run `simulator/a2a_server.py` and point an A2A client at `http://127.0.0.1:8920/a2a/` (see
-  [`simulator/README.md`](simulator/README.md)). The A2A surface is Chat-only (`ask`); the
-  Tools write actions are MCP-only.
-- **Persona = identity** — change `WORKIQ_SIM_PERSONA` to demo RBAC: an under-privileged
-  persona gets the restricted source withheld with a governance note while the rest of the
-  synthesis still returns.
+> **Persona = identity.** Set `WORKIQ_SIM_PERSONA` to demo governance: an under-privileged
+> persona gets restricted sources withheld with a note, while the rest of the answer still returns.
 
 ---
 
@@ -205,23 +126,23 @@ service principal, Copilot licensing, and registering the real MCP endpoint. The
 
 ## Starter kit
 
-Drop-in helpers in `starter-kit/` (rename / repath as needed):
+Connection helpers in `starter-kit/` to confirm your MCP wiring before you build (rename /
+repath as needed):
 
 | File | What it does |
 |---|---|
-| `workiq-agent_14-JUN-2026.mjs` | Minimal agent that calls Work IQ over MCP. |
-| `workiq-ask-harness_14-JUN-2026.mjs` | Fire a single question and print the cited answer. |
 | `workiq-mcp-smoke_14-JUN-2026.mjs` | Confirm your MCP connection + tool list. |
 | `workiq-smoke-test_14-JUN-2026.ps1` | PowerShell smoke test. |
 | `workiq-mcp-config_14-JUN-2026.json` | Reference MCP server config. |
+
+> These verify connectivity only — building the agent itself is up to you.
 
 ---
 
 ## Need more detail?
 
 - **The challenges** → `challenge-pack/WorkIQ-Hackathon-Challenge-Pack_14-JUN-2026.pdf`
-- **Full setup (both paths)** → `challenge-pack/WorkIQ-Hackathon-Participant-Setup-Guide_14-JUN-2026.pdf`
-- **Simulator internals, MCP/A2A config, scenario data** → [`simulator/README.md`](simulator/README.md)
-- **Architecture** → `challenge-pack/WorkIQ-Architecture-Guide_14-JUN-2026.pdf`
+- **Real Work IQ setup** → `challenge-pack/WorkIQ-Hackathon-Participant-Setup-Guide_14-JUN-2026.pdf`
+- **Simulator internals, MCP/A2A config, tool contract** → [`simulator/README.md`](simulator/README.md)
 
 Happy hacking. 🛠️

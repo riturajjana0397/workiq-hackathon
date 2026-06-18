@@ -8,8 +8,7 @@ Component: a2a_server.py
 Role:      Exposes the simulator's Work IQ **Chat** capability over the **A2A protocol**
            so agent-to-agent callers can reach it exactly as they would the real Work IQ
            A2A gateway. Companion to `server.py` (which exposes the same engine over MCP).
-           Faithful to the documented Work IQ A2A contract
-           (WorkIQ-Architecture-Guide_14-JUN-2026.pdf §7.1):
+           Faithful to the documented Work IQ A2A contract:
              * Wire format: JSON-RPC 2.0; POST the method in the BODY to the base URL
                (`/a2a/`), not in the path.
              * Method names: `SendMessage` (A2A v1.0, selected via `A2A-Version: 1.0`

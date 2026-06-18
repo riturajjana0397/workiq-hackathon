@@ -102,7 +102,7 @@ The simulator also exposes the same engine over the **A2A protocol** (agent-to-a
 callers that reach Work IQ as a *peer agent* rather than as an MCP tool. It speaks
 **JSON-RPC 2.0 over HTTP** — the method name (`SendMessage`, or the open-standard alias
 `message/send`) goes in the request **body**, POSTed to `/a2a/`. This mirrors the real Work
-IQ A2A gateway contract (see `..\challenge-pack\WorkIQ-Architecture-Guide_14-JUN-2026.pdf` §7.1).
+IQ A2A gateway contract.
 
 ```powershell
 .\.venv\Scripts\python.exe simulator\a2a_server.py
@@ -225,16 +225,6 @@ This is the same answer pipeline trimming on identity — the RBAC narrative the
 > startup warning to stderr (and fails closed to public-only visibility).
 
 ---
-
-## Mapping to the Challenge questions
-
-Each scenario's `golden.json` maps its 8 compound questions to cited answers across the four capability
-tiers. **C2 (Contoso):** Q3/Q4 stitch ≥2 source kinds; Q5/Q6 are agentic syntheses; Q7/Q8 expect a
-**Tools** action (`create_entity` into the milestone tracker / draft email). **C1 (Northbridge):** Q3/Q4 stitch
-program-channel + meetings and meetings + email; Q5/Q6 synthesise across *two committees* + email + the
-shared tracker; Q7 expects **`update_entity`** (flip open CAPA status + flag past-due) and Q8 drafts the
-readiness memo. See `..\challenge-pack\WorkIQ-Hackathon-Challenge-Pack_14-JUN-2026.pdf` §Challenge 1–2 and
-the per-challenge simulator-behaviour appendix.
 
 ## Adding Challenges 3–6 (data-only)
 
