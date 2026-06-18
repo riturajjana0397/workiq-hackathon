@@ -176,12 +176,34 @@ def _text_from_message(message: Any) -> str:
     for part in parts:
         if not isinstance(part, dict):
             continue
-        # A2A v1.0 TextPart uses {"kind": "text", "text": ...}; tolerate {"type": "text"}.
-        if part.get("kind") == "text" or part.get("type") == "text":
+        # A2A v1.0 TextPart uses {"kind": "text", "text": ...}; tolerate {"type": "text"};
+        # a2a-sdk 1.x (protobuf) serializes a bare {"text": ..., "metadata": {}} with no
+        # discriminator, so also accept any part carrying a string `text` value.
+        if part.get("kind") == "text" or part.get("type") == "text" or isinstance(part.get("text"), str):
             txt = part.get("text")
             if isinstance(txt, str):
                 chunks.append(txt)
     return "\n".join(chunks).strip()
+
+
+def _is_proto_dialect(message: dict[str, Any]) -> bool:
+    """True if the caller speaks the protobuf a2a-sdk JSON dialect (no `kind` discriminators).
+
+    The Microsoft Agent Framework's A2AAgent (a2a-sdk 1.x) emits enum roles like ROLE_USER and
+    bare text parts; the A2A JSON spec uses `user` plus `{"kind": "text"}`. Detect so we can
+    reply in the same dialect the caller parses.
+    """
+    if str(message.get("role", "")).upper().startswith("ROLE_"):
+        return True
+    for part in message.get("parts") or []:
+        if (
+            isinstance(part, dict)
+            and isinstance(part.get("text"), str)
+            and "kind" not in part
+            and "type" not in part
+        ):
+            return True
+    return False
 
 
 def _handle_send(params: dict[str, Any], header_persona: str | None) -> dict[str, Any]:
@@ -197,6 +219,7 @@ def _handle_send(params: dict[str, Any], header_persona: str | None) -> dict[str
     # Multi-turn continuity: reuse the caller's contextId if supplied, else mint one.
     context_id = (
         message.get("contextId")
+        or message.get("context_id")
         or params.get("contextId")
         or f"ctx-{uuid.uuid4().hex[:12]}"
     )
@@ -204,21 +227,43 @@ def _handle_send(params: dict[str, Any], header_persona: str | None) -> dict[str
     persona = _persona_from_params(params, header_persona)
     result = engine.ask(SCENARIO, question, persona_id=persona)
 
+    message_id = f"msg-{uuid.uuid4().hex[:12]}"
+    meta = {
+        "conversationId": result["conversationId"],
+        "citations": result["citations"],
+        "trimmed": result.get("trimmed", []),
+        "persona": persona or "all",
+    }
+
+    # Two A2A JSON dialects in the wild:
+    #   * JSON spec (a2a_e2e.py / curl): `result` is a bare Message with `kind` discriminators.
+    #   * protobuf a2a-sdk 1.x (Microsoft Agent Framework's A2AAgent): `result` is a oneof
+    #     {"message": <Message>}, no `kind` fields, enum role ROLE_AGENT, Part.data carries the
+    #     payload directly. Reply in whichever dialect the caller used.
+    if _is_proto_dialect(message):
+        return {
+            "message": {
+                "messageId": message_id,
+                "contextId": context_id,
+                "role": "ROLE_AGENT",
+                "parts": [
+                    {"text": result["response"]},
+                    {"data": {"citations": result["citations"]}},
+                ],
+                "metadata": meta,
+            }
+        }
+
     return {
         "kind": "message",
         "role": "agent",
-        "messageId": f"msg-{uuid.uuid4().hex[:12]}",
+        "messageId": message_id,
         "contextId": context_id,
         "parts": [
             {"kind": "text", "text": result["response"]},
             {"kind": "data", "data": {"citations": result["citations"]}},
         ],
-        "metadata": {
-            "conversationId": result["conversationId"],
-            "citations": result["citations"],
-            "trimmed": result.get("trimmed", []),
-            "persona": persona or "all",
-        },
+        "metadata": meta,
     }
 
 

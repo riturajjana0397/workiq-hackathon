@@ -167,8 +167,15 @@ asyncio.run(main())
 Run it from the repo root:
 
 ```powershell
-.\.venv\Scripts\python.exe agent.py
+.\.venv\Scripts\python.exe agent.py                  # MCP transport (default)
+.\.venv\Scripts\python.exe agent.py --transport a2a  # A2A transport (peer agent)
+.\.venv\Scripts\python.exe agent.py --ask "your own question"
 ```
+
+The shipped [`agent.py`](agent.py) is the dual-transport reference: `--transport mcp` (default)
+drives the simulator over `MCPStdioTool`; `--transport a2a` launches `simulator/a2a_server.py`
+and reaches it as a peer via `agent_framework_a2a.A2AAgent` (exposed to the Foundry model with
+`.as_tool()`). Both paths are verified end-to-end against a live Foundry model.
 
 ### Notes
 
@@ -177,9 +184,10 @@ Run it from the repo root:
   `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_CHAT_MODEL` (keep `MCPStdioTool` unchanged).
 - **Switch to the real Work IQ** — replace the tool's `command`/`args` with the real MCP
   launch (`npx -y @microsoft/workiq@preview mcp start`); everything else stays the same.
-- **A2A instead of MCP** — if your agent reaches Work IQ as a peer agent, run
-  `simulator/a2a_server.py` and point an A2A client at `http://127.0.0.1:8920/a2a/` (see
-  [`simulator/README.md`](simulator/README.md)).
+- **A2A instead of MCP** — `agent.py --transport a2a` does this for you; to wire it by hand,
+  run `simulator/a2a_server.py` and point an A2A client at `http://127.0.0.1:8920/a2a/` (see
+  [`simulator/README.md`](simulator/README.md)). The A2A surface is Chat-only (`ask`); the
+  Tools write actions are MCP-only.
 - **Persona = identity** — change `WORKIQ_SIM_PERSONA` to demo RBAC: an under-privileged
   persona gets the restricted source withheld with a governance note while the rest of the
   synthesis still returns.
