@@ -14,6 +14,10 @@ Microsoft 365 tenant**.
 > **Work IQ** grounds answers in your *live work context* — email, meetings, chats,
 > files, people, calendar and Copilot memory — reached over **MCP** and **A2A**.
 
+**Your build target:** an agent built with the **Microsoft Agent Framework** on an **Azure AI
+Foundry** model, connected to Work IQ over **both MCP and A2A**. See
+[**Build your agent**](#build-your-agent) below.
+
 ---
 
 ## What's in this repo
@@ -97,18 +101,48 @@ contracts.
 
 ## Build your agent
 
-The simulator is your Work IQ stand-in. It exposes the **same surface as the real thing**, so
-whatever you build here works unchanged against production Work IQ later:
+Your deliverable is an **agentic app**: a reasoning model that calls Work IQ, decides when to
+retrieve, and returns cited answers. The challenge is built and judged around a specific stack —
+**use it**:
 
-- **MCP** — `simulator/server.py` exposes the `ask_work_iq` tool (plus the Tools actions
-  `fetch` / `create_entity` / `update_entity`). Register it like any MCP server.
-- **A2A** — `simulator/a2a_server.py` serves Work IQ as a peer agent (JSON-RPC over HTTP,
-  agent card at `/.well-known/agent-card.json`).
+1. **Reasoning model — Azure AI Foundry.** Deploy a chat model in an **Azure AI Foundry** project
+   (e.g. `gpt-4o-mini`) and drive your agent with it.
+2. **Agent runtime — Microsoft Agent Framework.** Build the agent with the **Microsoft Agent
+   Framework** (Python). It hosts the model, runs the tool-calling loop, and connects to MCP/A2A.
+3. **Connect to Work IQ over BOTH transports.** Wire the **local simulator** into your agent over
+   **MCP _and_ A2A**. The same wiring works against real Work IQ later — you only swap the endpoint.
 
-How you turn that into an agent is the challenge. Pick your own LLM, framework, and transport,
-let the model decide when to call Work IQ, and make sure every answer carries the citations the
-tool returns. The tool contract, environment variables, and persona/RBAC behaviour are in
-[`simulator/README.md`](simulator/README.md) — start there.
+### 1. Install
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install agent-framework agent-framework-foundry agent-framework-a2a azure-identity
+```
+
+### 2. Configure your Foundry model (+ Entra auth)
+
+```powershell
+az login
+$env:FOUNDRY_PROJECT_ENDPOINT = "https://<your-foundry-project>.services.ai.azure.com/api/projects/<project>"
+$env:FOUNDRY_MODEL            = "gpt-4o-mini"   # your chat deployment name
+```
+
+### 3. Wire it up (the building blocks — assembling them is the challenge)
+
+- **Model client** — `FoundryChatClient` (from `agent_framework_foundry`): reads the `FOUNDRY_*`
+  env vars above and authenticates with `AzureCliCredential` (from `azure.identity`).
+- **Agent** — `Agent` (from `agent_framework`): give it the model client, your instructions, and
+  the Work IQ tool(s). Let the **model** decide when to call Work IQ — don't hard-code retrieval.
+- **MCP transport** — `MCPStdioTool` (from `agent_framework`): launch `simulator/server.py` as the
+  tool process so the model can call `ask_work_iq` (plus `fetch` / `create_entity` /
+  `update_entity` for the write tier). Set `WORKIQ_SIM_SCENARIO` and `WORKIQ_SIM_PERSONA` in its env.
+- **A2A transport** — run `simulator/a2a_server.py`, then reach it with `A2AAgent` (from
+  `agent_framework_a2a`) pointed at `http://127.0.0.1:8920`, and expose it to your orchestrating
+  `Agent` via `.as_tool(...)`.
+
+**Your agent must:** (1) run on a **Foundry** model via the **Microsoft Agent Framework**,
+(2) reach Work IQ over **both MCP and A2A**, (3) let the model decide when to retrieve, and
+(4) surface the **citations** Work IQ returns. The tool contract, env vars, and per-transport wire
+details are in [`simulator/README.md`](simulator/README.md) — start there.
 
 > **Persona = identity.** Set `WORKIQ_SIM_PERSONA` to demo governance: an under-privileged
 > persona gets restricted sources withheld with a note, while the rest of the answer still returns.
