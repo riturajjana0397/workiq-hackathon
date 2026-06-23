@@ -54,6 +54,33 @@ real server for **Path B** — your agent code doesn't change.
 
 ## Quick start — Path A (local simulator)
 
+### ⚡ Get the simulator running in 60 seconds
+
+**Need:** Python 3.10+ on your PATH. Run from the repo root (`workiq-hackathon/`):
+
+```powershell
+# 1. Clone (skip if you already have the repo)
+git clone https://github.com/kanhaiyasingh/workiq-hackathon.git
+cd workiq-hackathon
+
+# 2. Create a venv + install the one dependency
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r simulator\requirements.txt
+
+# 3. Verify it works (prints "ALL ... PASSED")
+.\.venv\Scripts\python.exe simulator\tests\smoke.py
+
+# 4. Ask it a question 🎉
+.\.venv\Scripts\python.exe simulator\demo.py --ask "What is blocking qualification?"
+```
+
+> macOS / Linux: use `python3 -m venv .venv` and `.venv/bin/python` instead of
+> `.\.venv\Scripts\python.exe`. If you see "python not found", install Python 3.10+ first.
+
+Done — you're ready to build. The full walkthrough is below.
+
+---
+
 **Prerequisite:** Python 3.10+ on your PATH.
 
 From the repo root (`workiq-hackathon/`):
