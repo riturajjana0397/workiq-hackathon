@@ -15,7 +15,7 @@ Usage
   # Run all 8 Challenge-1 compound questions as the default persona (new_pm):
   .\.venv\Scripts\python.exe simulator\demo.py
 
-  # Run as a specific persona (new_pm | quality_engineer | contractor | director):
+  # Run as a specific persona (ops_director | quality_pm | credentialing_lead | vendor_liaison):
   .\.venv\Scripts\python.exe simulator\demo.py --persona contractor
 
   # Ask one ad-hoc question:
@@ -47,7 +47,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 import engine  # noqa: E402
 
-DEFAULT_SCENARIO = SIM_DIR / "scenarios" / "c2-contoso"
+DEFAULT_SCENARIO = SIM_DIR / "scenarios" / "c1-northbridge"
 
 # ANSI helpers (degrade gracefully if the terminal doesn't render them).
 def _c(code: str, text: str) -> str:
@@ -130,8 +130,8 @@ def run_repl(sc: engine.Scenario, persona_id: str | None) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Work IQ simulator demo / manual tester")
     ap.add_argument("--scenario", default=str(DEFAULT_SCENARIO))
-    ap.add_argument("--persona", default="new_pm",
-                    help="new_pm | quality_engineer | contractor | director | all")
+    ap.add_argument("--persona", default="quality_pm",
+                    help="ops_director | quality_pm | credentialing_lead | vendor_liaison | all")
     ap.add_argument("--ask", help="ask a single question and exit")
     ap.add_argument("--rbac", type=int, metavar="N",
                     help="show question QN across all personas")
