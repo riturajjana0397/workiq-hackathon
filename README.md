@@ -18,6 +18,8 @@ Microsoft 365 tenant**.
 Foundry** model, connected to Work IQ over **both MCP and A2A**. See
 [**Build your agent**](#build-your-agent) below.
 
+If you are new to all of this, start with [BEGINNER_GUIDE.md](BEGINNER_GUIDE.md).
+
 ---
 
 ## What's in this repo
@@ -56,7 +58,7 @@ real server for **Path B** — your agent code doesn't change.
 
 ### ⚡ Get the simulator running in 60 seconds
 
-**Need:** Python 3.10+ on your PATH. Run from the repo root (`workiq-hackathon/`):
+**Need:** Python 3.10+ on your PATH. On Windows, use a non-ARM x64 Python if you can; Python 3.13 worked cleanly here and avoided source builds for `cryptography`. Run from the repo root (`workiq-hackathon/`):
 
 ```powershell
 # 1. Clone (skip if you already have the repo)
@@ -77,8 +79,8 @@ python -m venv .venv
 > macOS / Linux: use `python3 -m venv .venv` and `.venv/bin/python` instead of
 > `.\.venv\Scripts\python.exe`. If you see "python not found", install Python 3.10+ first.
 
-Done — you're ready to build. The full walkthrough is below.
-
+> If `pip` tries to build `cryptography` on Windows, recreate the venv with x64 Python 3.13
+> or install the Visual Studio Build Tools with the C++ workload.
 ---
 
 **Prerequisite:** Python 3.10+ on your PATH.

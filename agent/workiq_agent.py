@@ -68,7 +68,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 MCP_SCRIPT = REPO_ROOT / "simulator" / "server.py"
 
-FOUNDRY_ENDPOINT = "https://aparnaram-foundry-subdomain.services.ai.azure.com/openai/v1"
+FOUNDRY_ENDPOINT = os.environ.get(
+    "AZURE_AI_FOUNDRY_ENDPOINT",
+    "https://aparnaram-foundry-subdomain.services.ai.azure.com/openai/v1",
+)
 DEPLOYMENT = os.environ.get("AZURE_AI_FOUNDRY_DEPLOYMENT", "gpt-4o-mini")
 PERSONA = os.environ.get("WORKIQ_SIM_PERSONA", "quality_pm")
 SCENARIO = "scenarios/c1-northbridge"
