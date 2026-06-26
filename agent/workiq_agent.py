@@ -145,7 +145,7 @@ def build_chat_client() -> tuple[OpenAIChatClient, AzureCliCredential]:
 # Tool surfaces                                                                #
 # ---------------------------------------------------------------------------- #
 
-def build_mcp_tool() -> MCPStdioTool:
+def build_mcp_tool(persona: str | None = None) -> MCPStdioTool:
     """Spawn the local Work IQ MCP server as a child process and surface its
     tools to the model. Persona is injected via env so RBAC kicks in.
     """
@@ -167,7 +167,7 @@ def build_mcp_tool() -> MCPStdioTool:
         args=[str(MCP_SCRIPT)],
         env={
             **os.environ,
-            "WORKIQ_SIM_PERSONA": PERSONA,
+            "WORKIQ_SIM_PERSONA": persona or PERSONA,
             "WORKIQ_SIM_SCENARIO": SCENARIO,
         },
     )
