@@ -51,8 +51,10 @@ import os
 import sys
 from pathlib import Path
 
-from openai import AsyncAzureOpenAI
+from openai import AsyncOpenAI
 import httpx
+
+from azure.identity.aio import AzureCliCredential, get_bearer_token_provider
 
 # Microsoft Agent Framework imports — verified against the installed version.
 from agent_framework import Agent, MCPStdioTool
@@ -68,10 +70,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 MCP_SCRIPT = REPO_ROOT / "simulator" / "server.py"
 
-FOUNDRY_ENDPOINT = os.environ.get(
-    "AZURE_OPENAI_ENDPOINT", "https://ssomo-mqtn76io-eastus2.openai.azure.com/"
+FOUNDRY_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get(
+    "AZURE_AI_FOUNDRY_ENDPOINT", ""
 )
-AZURE_OPENAI_API_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "")
 DEPLOYMENT = os.environ.get("AZURE_AI_FOUNDRY_DEPLOYMENT", "gpt-4o-mini")
 PERSONA = os.environ.get("WORKIQ_SIM_PERSONA", "quality_pm")
 SCENARIO = "scenarios/c1-northbridge"
@@ -117,20 +118,26 @@ Honesty & governance:
 # ---------------------------------------------------------------------------- #
 
 def build_chat_client() -> OpenAIChatClient:
-    """Construct an OpenAI-compatible chat client backed by Azure OpenAI.
+    """Construct an OpenAI-compatible chat client backed by Azure AI Foundry.
 
-    Uses API key authentication against the Azure OpenAI endpoint.
-    Set AZURE_OPENAI_API_KEY in your environment.
+    Auth: AzureCliCredential -> bearer token provider against
+    https://ai.azure.com/.default. Tokens refresh automatically because the
+    openai SDK accepts a callable for `api_key`.
+
+    Endpoint comes from AZURE_OPENAI_ENDPOINT (or AZURE_AI_FOUNDRY_ENDPOINT).
     """
-    if not AZURE_OPENAI_API_KEY:
+    if not FOUNDRY_ENDPOINT:
         raise RuntimeError(
-            "AZURE_OPENAI_API_KEY environment variable is not set. "
-            "Copy it from Azure AI Foundry > Endpoints and keys."
+            "AZURE_OPENAI_ENDPOINT (or AZURE_AI_FOUNDRY_ENDPOINT) is not set. "
+            "Set it to your Foundry /openai/v1 endpoint."
         )
-    openai_client = AsyncAzureOpenAI(
-        azure_endpoint=FOUNDRY_ENDPOINT,
-        api_key=AZURE_OPENAI_API_KEY,
-        api_version="2025-03-01-preview",
+    credential = AzureCliCredential()
+    token_provider = get_bearer_token_provider(
+        credential, "https://ai.azure.com/.default"
+    )
+    openai_client = AsyncOpenAI(
+        base_url=FOUNDRY_ENDPOINT,
+        api_key=token_provider,  # type: ignore[arg-type]
     )
     chat_client = OpenAIChatClient(
         model=DEPLOYMENT,
