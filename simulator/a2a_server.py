@@ -28,7 +28,7 @@ and are intentionally NOT exposed here.
 
 Environment
 -----------
-  WORKIQ_SIM_SCENARIO   Scenario dir (abs or relative to this file). Default c2-contoso.
+  WORKIQ_SIM_SCENARIO   Scenario dir (abs or relative to this file). Default c1-northbridge.
   WORKIQ_SIM_PERSONA    Default persona id for permission trimming. Default new_pm.
                         Unset/"all" => full visibility. Override per-request via the
                         message metadata `persona` field or the `X-WorkIQ-Persona` header.
@@ -76,11 +76,11 @@ def _scenario_dir() -> Path:
     if raw:
         p = Path(raw)
         return p if p.is_absolute() else (SERVER_DIR / p)
-    return SERVER_DIR / "scenarios" / "c2-contoso"
+    return SERVER_DIR / "scenarios" / "c1-northbridge"
 
 
 def _default_persona() -> str | None:
-    p = os.environ.get("WORKIQ_SIM_PERSONA", "new_pm")
+    p = os.environ.get("WORKIQ_SIM_PERSONA", "quality_pm")
     if not p or p.lower() == "all":
         return None
     return p

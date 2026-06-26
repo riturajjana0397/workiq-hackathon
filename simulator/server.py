@@ -14,10 +14,10 @@ Role:      Exposes the EXACT real Work IQ tool contract (`ask_work_iq`) plus the
 Environment
 -----------
   WORKIQ_SIM_SCENARIO   Absolute or relative path to the scenario dir.
-                        Default: scenarios/c2-contoso (next to this file).
+                        Default: scenarios/c1-northbridge (next to this file).
   WORKIQ_SIM_PERSONA    Active persona id for permission trimming
-                        (new_pm | quality_engineer | contractor | director).
-                        Default: new_pm. Unset/"all" => full visibility.
+                        (ops_director | quality_pm | credentialing_lead | vendor_liaison).
+                        Default: quality_pm. Unset/"all" => full visibility.
   OPENAI_API_KEY/...    Optional. Enables LLM fallback for ad-hoc (non-golden) questions.
 
 Run:
@@ -45,11 +45,11 @@ def _scenario_dir() -> Path:
     if raw:
         p = Path(raw)
         return p if p.is_absolute() else (SERVER_DIR / p)
-    return SERVER_DIR / "scenarios" / "c2-contoso"
+    return SERVER_DIR / "scenarios" / "c1-northbridge"
 
 
 def _persona() -> str | None:
-    p = os.environ.get("WORKIQ_SIM_PERSONA", "new_pm")
+    p = os.environ.get("WORKIQ_SIM_PERSONA", "quality_pm")
     if not p or p.lower() == "all":
         return None
     return p
