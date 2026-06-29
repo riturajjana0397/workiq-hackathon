@@ -23,12 +23,14 @@ Same as workiq_agent.py:
 
 from __future__ import annotations
 
+import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+import time
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -47,14 +49,23 @@ from workiq_agent import (  # noqa: E402
     build_chat_client,
     build_mcp_tool,
 )
+from telemetry import (
+    record_usage,
+    setup_telemetry,
+    span_context_attributes,
+)  # noqa: E402
 
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------- #
 # Lifespan: build the agent once, tear it down cleanly on shutdown.            #
 # ---------------------------------------------------------------------------- #
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    telemetry = setup_telemetry("workiq-web")
     chat_client, credential = build_chat_client()
     mcp_tool = build_mcp_tool()
     a2a_agent = build_a2a_agent()
@@ -73,17 +84,8 @@ async def lifespan(app: FastAPI):
     app.state._mcp = mcp_tool
     app.state._a2a = a2a_agent
     app.state._credential = credential
+    app.state._telemetry = telemetry
 
-    print(
-        "[workiq-web] agent ready\n"
-        f"  Foundry deployment : {DEPLOYMENT}\n"
-        f"  Scenario           : {SCENARIO}\n"
-        f"  Persona            : {PERSONA}\n"
-        f"  MCP child          : {MCP_SCRIPT.name}\n"
-        f"  A2A card           : {A2A_CARD_URL}\n"
-        "  Open               : http://127.0.0.1:8000",
-        file=sys.stderr,
-    )
     try:
         yield
     finally:
@@ -99,23 +101,58 @@ app = FastAPI(title="Work IQ Orchestrator UI", lifespan=lifespan)
 # API                                                                           #
 # ---------------------------------------------------------------------------- #
 
+
 class AskRequest(BaseModel):
     question: str
 
 
 @app.post("/ask")
-async def ask(req: AskRequest) -> dict:
+async def ask(req: AskRequest, request: Request) -> dict:
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="question is required")
 
-    response = await app.state.agent.run(q)
-    text = (
-        getattr(response, "text", None)
-        or getattr(response, "content", None)
-        or str(response)
-    )
-    return {"answer": text}
+    telemetry = request.app.state._telemetry
+    started = time.perf_counter()
+    try:
+        with telemetry.tracer.start_as_current_span(
+            "workiq.web.ask",
+            attributes=span_context_attributes(
+                service="workiq-web",
+                scenario=SCENARIO,
+                persona=PERSONA,
+                deployment=DEPLOYMENT,
+            question=q,
+                question_chars=len(q),
+            ),
+        ) as span:
+            response = await request.app.state.agent.run(q)
+            usage = record_usage(telemetry, response, span)
+            text = (
+                getattr(response, "text", None)
+                or getattr(response, "content", None)
+                or str(response)
+            )
+            if usage:
+                span.set_attribute("workiq.total_tokens", usage.get("total_tokens", 0))
+            return {"answer": text}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        telemetry.failures.add(1)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        telemetry.requests.add(1)
+        telemetry.latency_ms.record(
+            elapsed_ms,
+            attributes=span_context_attributes(
+                service="workiq-web",
+                scenario=SCENARIO,
+                persona=PERSONA,
+                deployment=DEPLOYMENT,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------- #
@@ -226,10 +263,18 @@ form.addEventListener('submit', async (e) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question: text }),
     });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+    const raw = await r.text();
+    let data = null;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      data = null;
+    }
+    if (!r.ok) {
+      throw new Error((data && data.detail) || raw || ('HTTP ' + r.status));
+    }
     placeholder.classList.remove('thinking');
-    placeholder.innerHTML = marked.parse(data.answer || '(no answer)');
+    placeholder.innerHTML = marked.parse((data && data.answer) || raw || '(no answer)');
   } catch (err) {
     placeholder.remove();
     add('error', 'error: ' + escape(String(err.message || err)));
@@ -261,6 +306,7 @@ async def index() -> str:
 # ---------------------------------------------------------------------------- #
 # Entrypoint                                                                    #
 # ---------------------------------------------------------------------------- #
+
 
 def main() -> int:
     uvicorn.run(
