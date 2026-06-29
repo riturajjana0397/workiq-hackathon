@@ -114,6 +114,9 @@ async def ask(req: AskRequest, request: Request) -> dict:
 
     telemetry = request.app.state._telemetry
     started = time.perf_counter()
+    elapsed_ms = 0.0
+    usage: dict[str, int] = {}
+    answer_text = ""
     try:
         with telemetry.tracer.start_as_current_span(
             "workiq.web.ask",
@@ -122,20 +125,19 @@ async def ask(req: AskRequest, request: Request) -> dict:
                 scenario=SCENARIO,
                 persona=PERSONA,
                 deployment=DEPLOYMENT,
-            question=q,
+                question=q,
                 question_chars=len(q),
             ),
         ) as span:
             response = await request.app.state.agent.run(q)
             usage = record_usage(telemetry, response, span)
-            text = (
+            answer_text = (
                 getattr(response, "text", None)
                 or getattr(response, "content", None)
                 or str(response)
             )
             if usage:
                 span.set_attribute("workiq.total_tokens", usage.get("total_tokens", 0))
-            return {"answer": text}
     except HTTPException:
         raise
     except Exception as exc:
@@ -153,6 +155,12 @@ async def ask(req: AskRequest, request: Request) -> dict:
                 deployment=DEPLOYMENT,
             ),
         )
+
+    return {
+        "answer": answer_text,
+        "usage": usage,
+        "latency_ms": round(elapsed_ms, 2),
+    }
 
 
 # ---------------------------------------------------------------------------- #
@@ -211,6 +219,22 @@ INDEX_HTML = r"""<!doctype html>
     padding: 0 18px; font-weight: 600; cursor: pointer;
   }
   button:disabled { background: #3a3f4f; cursor: not-allowed; }
+  #usage {
+    position: fixed; right: 16px; bottom: 16px; z-index: 20;
+    width: 240px; background: rgba(18, 22, 31, 0.96);
+    border: 1px solid #2a2d38; border-radius: 12px;
+    padding: 12px 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+    backdrop-filter: blur(10px);
+    font-size: 12px; line-height: 1.45;
+  }
+  #usage .title { color: #9cc7ff; font-weight: 700; margin-bottom: 6px; }
+  #usage .row { display: flex; justify-content: space-between; gap: 12px; }
+  #usage .label { color: #8a8f9c; }
+  #usage .value { color: #e6e6e6; font-variant-numeric: tabular-nums; }
+  #usage .hint { margin-top: 8px; color: #8a8f9c; }
+  @media (max-width: 780px) {
+    #usage { left: 16px; right: 16px; bottom: 76px; width: auto; }
+  }
 </style>
 </head>
 <body>
@@ -220,6 +244,16 @@ INDEX_HTML = r"""<!doctype html>
 </header>
 
 <div id="log"></div>
+
+<aside id="usage" aria-live="polite">
+  <div class="title">Usage this session</div>
+  <div class="row"><span class="label">Turns</span><span class="value" id="u-turns">0</span></div>
+  <div class="row"><span class="label">Prompt tokens</span><span class="value" id="u-prompt">0</span></div>
+  <div class="row"><span class="label">Completion tokens</span><span class="value" id="u-completion">0</span></div>
+  <div class="row"><span class="label">Total tokens</span><span class="value" id="u-total">0</span></div>
+  <div class="row"><span class="label">Last latency</span><span class="value" id="u-latency">0 ms</span></div>
+  <div class="hint">Use this as a proxy for model credits consumed.</div>
+</aside>
 
 <form id="form">
   <textarea id="q" placeholder="Ask something — e.g. 'what's blocking PPAP qualification?'" required></textarea>
@@ -231,6 +265,17 @@ const log  = document.getElementById('log');
 const form = document.getElementById('form');
 const q    = document.getElementById('q');
 const send = document.getElementById('send');
+const usageState = {
+  turns: 0,
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+};
+const uTurns = document.getElementById('u-turns');
+const uPrompt = document.getElementById('u-prompt');
+const uCompletion = document.getElementById('u-completion');
+const uTotal = document.getElementById('u-total');
+const uLatency = document.getElementById('u-latency');
 
 function add(kind, html) {
   const div = document.createElement('div');
@@ -245,6 +290,14 @@ function escape(s) {
   return s.replace(/[&<>"']/g, c => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
+}
+
+function refreshUsage(latencyMs) {
+  uTurns.textContent = String(usageState.turns);
+  uPrompt.textContent = String(usageState.promptTokens);
+  uCompletion.textContent = String(usageState.completionTokens);
+  uTotal.textContent = String(usageState.totalTokens);
+  uLatency.textContent = Number.isFinite(latencyMs) ? `${latencyMs.toFixed(0)} ms` : '0 ms';
 }
 
 form.addEventListener('submit', async (e) => {
@@ -273,6 +326,12 @@ form.addEventListener('submit', async (e) => {
     if (!r.ok) {
       throw new Error((data && data.detail) || raw || ('HTTP ' + r.status));
     }
+    const turnUsage = (data && data.usage) || {};
+    usageState.turns += 1;
+    usageState.promptTokens += Number(turnUsage.prompt_tokens || 0);
+    usageState.completionTokens += Number(turnUsage.completion_tokens || 0);
+    usageState.totalTokens += Number(turnUsage.total_tokens || 0);
+    refreshUsage(Number(data && data.latency_ms));
     placeholder.classList.remove('thinking');
     placeholder.innerHTML = marked.parse((data && data.answer) || raw || '(no answer)');
   } catch (err) {

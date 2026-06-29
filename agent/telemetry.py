@@ -60,17 +60,20 @@ def extract_usage(response: Any) -> dict[str, int]:
     candidates = [
         response,
         getattr(response, "usage", None),
+        getattr(response, "usage_details", None),
         getattr(response, "metadata", None),
         getattr(response, "result", None),
         getattr(response, "message", None),
         getattr(response, "data", None),
     ]
 
-    prompt_tokens = _find_number(candidates, "prompt_tokens", "input_tokens")
-    completion_tokens = _find_number(
-        candidates, "completion_tokens", "output_tokens"
+    prompt_tokens = _find_number(
+        candidates, "prompt_tokens", "input_tokens", "input_token_count"
     )
-    total_tokens = _find_number(candidates, "total_tokens")
+    completion_tokens = _find_number(
+        candidates, "completion_tokens", "output_tokens", "output_token_count"
+    )
+    total_tokens = _find_number(candidates, "total_tokens", "total_token_count")
 
     if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
         total_tokens = prompt_tokens + completion_tokens
