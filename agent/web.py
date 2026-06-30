@@ -91,79 +91,82 @@ async def lifespan(app: FastAPI):
     # Pre-warm the remaining personas in the background so switching personas
     # never stalls a request on a cold start (each spawns its own MCP child).
     async def _prewarm():
-          # Get or create a session for conversation memory.
-          session_id = req.session_id or "default"
-          session_key = f"{persona}:{session_id}"
-          if session_key not in request.app.state.sessions:
-            request.app.state.sessions[session_key] = AgentSession(session_id=session_key)
-          session = request.app.state.sessions[session_key]
+        for p in _scenario.personas:
+            pid = p["id"]
+            if pid in app.state.agents:
+                continue
+            try:
+                await get_persona_agent(app, pid)
+            except Exception as exc:  # don't let one persona break the rest
+                print(f"[workiq-web] prewarm failed for '{pid}': {exc}", file=sys.stderr)
+    app.state._prewarm_task = asyncio.create_task(_prewarm())
 
-          started = time.perf_counter()
-          elapsed_ms = 0.0
-          usage: dict[str, int] = {}
-          answer_text = ""
-          try:
-            with telemetry.tracer.start_as_current_span(
-              "workiq.web.ask",
-              attributes=span_context_attributes(
-                service="workiq-web",
-                scenario=SCENARIO,
-                persona=persona,
-                deployment=DEPLOYMENT,
-                question=q,
-                question_chars=len(q),
-              ),
-            ) as span:
-              response = await agent.run(q, session=session)
-              usage = record_usage(telemetry, response, span)
-              answer_text = (
-                getattr(response, "text", None)
-                or getattr(response, "content", None)
-                or str(response)
-              )
-              if usage:
-                span.set_attribute("workiq.total_tokens", usage.get("total_tokens", 0))
-          except HTTPException:
-            raise
-          except Exception as exc:
-            telemetry.failures.add(1)
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-          finally:
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            telemetry.requests.add(1)
-            telemetry.latency_ms.record(
-              elapsed_ms,
-              attributes=span_context_attributes(
-                service="workiq-web",
-                scenario=SCENARIO,
-                persona=persona,
-                deployment=DEPLOYMENT,
-              ),
-            )
+    print(
+        "[workiq-web] agent ready\n"
+        f"  Foundry deployment : {DEPLOYMENT}\n"
+        f"  Scenario           : {SCENARIO}\n"
+        f"  Default persona    : {PERSONA}\n"
+        f"  Personas available : {', '.join(p['id'] for p in _scenario.personas)}\n"
+        f"  MCP child          : {MCP_SCRIPT.name}\n"
+        f"  A2A card           : {A2A_CARD_URL}\n"
+        "  Open               : http://127.0.0.1:8000",
+        file=sys.stderr,
+    )
+    try:
+        yield
+    finally:
+        for entry in app.state.agents.values():
+            try:
+                await entry["a2a"].__aexit__(None, None, None)
+            except Exception:
+                pass
+            try:
+                await entry["mcp"].__aexit__(None, None, None)
+            except Exception:
+                pass
 
-          # Convert bare citation IDs into links for the UI.
-          import re
 
-          def _linkify_citation(m):
-            cid = m.group(0)
-            entry = _scenario.index.get(cid)
-            if entry:
-              kind, _rec = entry
-              return f"[{cid}](https://simulator.local/{kind}/{cid})"
-            return cid
+async def get_persona_agent(app: FastAPI, persona: str):
+    """Return (building if needed) the cached agent stack for a persona.
 
-          answer_text = re.sub(
-            r"(?<![/\[] )\b(MTG|EML|MSG|FILE|PPL|CAPA|AI)-\d{3}\b(?!\])".replace(" ", ""),
-            _linkify_citation,
-            answer_text,
-          )
+    Each persona gets its own MCP child process and A2A session so the
+    simulator applies that persona's RBAC. Stacks are cached for reuse.
+    """
+    valid = {p["id"] for p in _scenario.personas}
+    if persona not in valid:
+        persona = PERSONA
 
-          return {
-            "answer": answer_text,
-            "persona": persona,
-            "usage": usage,
-            "latency_ms": round(elapsed_ms, 2),
-          }
+    cached = app.state.agents.get(persona)
+    if cached:
+        return cached["agent"]
+
+    async with app.state.build_lock:
+        # Re-check inside the lock in case another request built it.
+        cached = app.state.agents.get(persona)
+        if cached:
+            return cached["agent"]
+
+        mcp_tool = build_mcp_tool(persona)
+        a2a_agent = build_a2a_agent(persona)
+        await mcp_tool.__aenter__()
+        await a2a_agent.__aenter__()
+
+        agent = Agent(
+            client=app.state.chat_client,
+            name="workiq-orchestrator",
+            instructions=INSTRUCTIONS,
+            tools=[mcp_tool, a2a_agent.as_tool()],
+        )
+        app.state.agents[persona] = {
+            "agent": agent,
+            "mcp": mcp_tool,
+            "a2a": a2a_agent,
+        }
+        print(f"[workiq-web] built agent for persona '{persona}'", file=sys.stderr)
+        return agent
+
+
+app = FastAPI(title="Work IQ Orchestrator UI", lifespan=lifespan)
 
 
 class AskRequest(BaseModel):
@@ -198,79 +201,79 @@ async def ask(req: AskRequest, request: Request) -> dict:
     persona = (req.persona or PERSONA).strip()
     agent = await get_persona_agent(request.app, persona)
 
-  # Get or create a session for conversation memory.
-  session_id = req.session_id or "default"
-  session_key = f"{persona}:{session_id}"
-  if session_key not in request.app.state.sessions:
-    request.app.state.sessions[session_key] = AgentSession(session_id=session_key)
-  session = request.app.state.sessions[session_key]
+    # Get or create a session for conversation memory.
+    session_id = req.session_id or "default"
+    session_key = f"{persona}:{session_id}"
+    if session_key not in request.app.state.sessions:
+        request.app.state.sessions[session_key] = AgentSession(session_id=session_key)
+    session = request.app.state.sessions[session_key]
 
-  started = time.perf_counter()
-  elapsed_ms = 0.0
-  usage: dict[str, int] = {}
-  answer_text = ""
-  try:
-    with telemetry.tracer.start_as_current_span(
-      "workiq.web.ask",
-      attributes=span_context_attributes(
-        service="workiq-web",
-        scenario=SCENARIO,
-        persona=persona,
-        deployment=DEPLOYMENT,
-        question=q,
-        question_chars=len(q),
-      ),
-    ) as span:
-      response = await agent.run(q, session=session)
-      usage = record_usage(telemetry, response, span)
-      answer_text = (
-        getattr(response, "text", None)
-        or getattr(response, "content", None)
-        or str(response)
-      )
-      if usage:
-        span.set_attribute("workiq.total_tokens", usage.get("total_tokens", 0))
-  except HTTPException:
-    raise
-  except Exception as exc:
-    telemetry.failures.add(1)
-    raise HTTPException(status_code=500, detail=str(exc)) from exc
-  finally:
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    telemetry.requests.add(1)
-    telemetry.latency_ms.record(
-      elapsed_ms,
-      attributes=span_context_attributes(
-        service="workiq-web",
-        scenario=SCENARIO,
-        persona=persona,
-        deployment=DEPLOYMENT,
-      ),
+    started = time.perf_counter()
+    elapsed_ms = 0.0
+    usage: dict[str, int] = {}
+    answer_text = ""
+    try:
+        with telemetry.tracer.start_as_current_span(
+            "workiq.web.ask",
+            attributes=span_context_attributes(
+                service="workiq-web",
+                scenario=SCENARIO,
+                persona=persona,
+                deployment=DEPLOYMENT,
+                question=q,
+                question_chars=len(q),
+            ),
+        ) as span:
+            response = await agent.run(q, session=session)
+            usage = record_usage(telemetry, response, span)
+            answer_text = (
+                getattr(response, "text", None)
+                or getattr(response, "content", None)
+                or str(response)
+            )
+            if usage:
+                span.set_attribute("workiq.total_tokens", usage.get("total_tokens", 0))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        telemetry.failures.add(1)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        telemetry.requests.add(1)
+        telemetry.latency_ms.record(
+            elapsed_ms,
+            attributes=span_context_attributes(
+                service="workiq-web",
+                scenario=SCENARIO,
+                persona=persona,
+                deployment=DEPLOYMENT,
+            ),
+        )
+
+    # Convert bare citation IDs into links for the UI.
+    import re
+
+    def _linkify_citation(m):
+        cid = m.group(0)
+        entry = _scenario.index.get(cid)
+        if entry:
+            kind, _rec = entry
+            return f"[{cid}](https://simulator.local/{kind}/{cid})"
+        return cid
+
+    answer_text = re.sub(
+        r"(?<![/\[] )\b(MTG|EML|MSG|FILE|PPL|CAPA|AI)-\d{3}\b(?!\])".replace(" ", ""),
+        _linkify_citation,
+        answer_text,
     )
 
-  # Convert bare citation IDs into links for the UI.
-  import re
-
-  def _linkify_citation(m):
-    cid = m.group(0)
-    entry = _scenario.index.get(cid)
-    if entry:
-      kind, _rec = entry
-      return f"[{cid}](https://simulator.local/{kind}/{cid})"
-    return cid
-
-  answer_text = re.sub(
-    r"(?<![/\[] )\b(MTG|EML|MSG|FILE|PPL|CAPA|AI)-\d{3}\b(?!\])".replace(" ", ""),
-    _linkify_citation,
-    answer_text,
-  )
-
-  return {
-    "answer": answer_text,
-    "persona": persona,
-    "usage": usage,
-    "latency_ms": round(elapsed_ms, 2),
-  }
+    return {
+        "answer": answer_text,
+        "persona": persona,
+        "usage": usage,
+        "latency_ms": round(elapsed_ms, 2),
+    }
 
 
 # ---------------------------------------------------------------------------- #
