@@ -265,6 +265,92 @@ Run `/mcp` inside Copilot CLI any time to confirm the `workiq` server is connect
 
 ---
 
+## Running the Agent (Azure AI Foundry + Simulator)
+
+### 1. Login to the correct tenant (one-time)
+
+```powershell
+az login --tenant 91250b22-e679-44bb-b688-b585aeae176e
+az account set --subscription e15576d7-67e8-4ed2-acab-42c5885ea1fd
+```
+
+### 2. Set environment variables (every new terminal session)
+
+```powershell
+$env:AZURE_OPENAI_ENDPOINT = "https://ssomo-mqtn76io-eastus2.cognitiveservices.azure.com/openai/v1"
+$env:AZURE_AI_FOUNDRY_DEPLOYMENT = "gpt-4o-mini"
+$env:AZURE_EMBEDDING_DEPLOYMENT = "text-embedding-3-small"
+$env:WORKIQ_SIM_PERSONA = "quality_pm"
+```
+
+### 2a. Optional: Enable telemetry + Application Insights
+
+The agent and web app now emit OpenTelemetry metrics and spans through
+`agent/telemetry.py`. If you provide an Application Insights connection string,
+telemetry is exported to Azure Monitor.
+
+Install the optional exporter dependency:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install azure-monitor-opentelemetry
+```
+
+Set telemetry environment variables in the same terminal before starting the
+agent or web app:
+
+```powershell
+$env:APPLICATIONINSIGHTS_CONNECTION_STRING = "InstrumentationKey=<key>;IngestionEndpoint=https://<region>.in.applicationinsights.azure.com/"
+$env:AZURE_EXPERIMENTAL_ENABLE_GENAI_TRACING = "true"
+```
+
+What is emitted:
+
+* Metrics
+  * `workiq_requests_total`
+  * `workiq_request_failures_total`
+  * `workiq_request_latency_ms`
+  * `workiq_prompt_tokens_total`
+  * `workiq_completion_tokens_total`
+  * `workiq_total_tokens_total`
+* Spans
+  * `workiq.agent.turn` from `agent/workiq_agent.py`
+  * `workiq.web.ask` from `agent/web.py`
+* Span attributes include scenario, persona, deployment, request size, and token usage.
+
+If `APPLICATIONINSIGHTS_CONNECTION_STRING` is not set, the app still runs and
+telemetry stays local (no export).
+
+### 3. Start A2A simulator (in a separate terminal)
+
+```powershell
+cd c:\Users\somolinasaha\workiq\workiq-hackathon-prototype
+.\.venv\Scripts\python.exe simulator\a2a_server.py
+```
+
+### 4. Run the agent (in another terminal)
+
+```powershell
+cd c:\Users\somolinasaha\workiq\workiq-hackathon-prototype
+$env:AZURE_OPENAI_ENDPOINT = "https://ssomo-mqtn76io-eastus2.cognitiveservices.azure.com/openai/v1"
+$env:AZURE_AI_FOUNDRY_DEPLOYMENT = "gpt-4o-mini"
+$env:AZURE_EMBEDDING_DEPLOYMENT = "text-embedding-3-small"
+$env:WORKIQ_SIM_PERSONA = "quality_pm"
+.\.venv\Scripts\python.exe agent\workiq_agent.py --ask "What is blocking PPAP qualification?"
+```
+
+### 5. Run the web agent (interactive UI)
+
+```powershell
+cd c:\Users\somolinasaha\workiq\workiq-hackathon-prototype
+$env:AZURE_OPENAI_ENDPOINT = "https://ssomo-mqtn76io-eastus2.cognitiveservices.azure.com/openai/v1"
+$env:AZURE_AI_FOUNDRY_DEPLOYMENT = "gpt-4o-mini"
+$env:AZURE_EMBEDDING_DEPLOYMENT = "text-embedding-3-small"
+$env:WORKIQ_SIM_PERSONA = "quality_pm"
+.\.venv\Scripts\python.exe agent\web.py
+```
+
+---
+
 ## Need more detail?
 
 - **The challenges** → `challenge-pack/WorkIQ-Hackathon-Challenge-Pack_14-JUN-2026.pdf`

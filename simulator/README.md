@@ -63,6 +63,8 @@ simulator/
 .\.venv\Scripts\python.exe -m pip install -r simulator\requirements.txt
 ```
 
+> Windows note: if `pip` starts compiling `cryptography`, use x64 Python 3.13 for the venv or install the Visual Studio Build Tools (C++ workload) before retrying.
+
 `openai` is optional — the 8 scripted (golden) questions answer deterministically with
 **no model**. A model only powers ad-hoc, off-script questions (see *LLM fallback*).
 
