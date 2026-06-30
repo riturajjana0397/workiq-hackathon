@@ -49,6 +49,7 @@ from workiq_agent import (  # noqa: E402
     build_chat_client,
     build_mcp_tool,
 )
+from agent_framework import AgentSession  # noqa: E402
 
 # Load scenario data for citation lookup
 sys.path.insert(0, str(REPO_ROOT / "simulator"))
@@ -69,6 +70,8 @@ async def lifespan(app: FastAPI):
     # persona id -> {"agent", "mcp", "a2a"} built lazily on first use.
     app.state.agents = {}
     app.state.build_lock = asyncio.Lock()
+    # session_key -> AgentSession for conversation memory
+    app.state.sessions = {}
 
     # Warm up the default persona so the first request is fast.
     await get_persona_agent(app, PERSONA)
@@ -161,6 +164,7 @@ app = FastAPI(title="Work IQ Orchestrator UI", lifespan=lifespan)
 class AskRequest(BaseModel):
     question: str
     persona: str | None = None
+    session_id: str | None = None
 
 
 @app.get("/personas")
@@ -188,12 +192,34 @@ async def ask(req: AskRequest) -> dict:
     persona = (req.persona or PERSONA).strip()
     agent = await get_persona_agent(app, persona)
 
-    response = await agent.run(q)
+    # Get or create a session for conversation memory
+    session_id = req.session_id or "default"
+    session_key = f"{persona}:{session_id}"
+    if session_key not in app.state.sessions:
+        app.state.sessions[session_key] = AgentSession(session_id=session_key)
+    session = app.state.sessions[session_key]
+
+    response = await agent.run(q, session=session)
     text = (
         getattr(response, "text", None)
         or getattr(response, "content", None)
         or str(response)
     )
+
+    # Post-process: convert bare citation IDs (e.g. MTG-001, EML-002) into
+    # clickable simulator links so the UI can render them.
+    # Skip IDs already inside markdown links (preceded by / or [).
+    import re
+    def _linkify_citation(m):
+        cid = m.group(0)
+        entry = _scenario.index.get(cid)
+        if entry:
+            kind, _rec = entry
+            title = cid
+            return f"[{title}](https://simulator.local/{kind}/{cid})"
+        return cid
+    text = re.sub(r'(?<![/\[])\b(MTG|EML|MSG|FILE|PPL|CAPA|AI)-\d{3}\b(?!\])', _linkify_citation, text)
+
     return {"answer": text, "persona": persona}
 
 
@@ -233,6 +259,12 @@ INDEX_HTML = r"""<!doctype html>
     border: 0; border-radius: 8px; font-weight: 600; cursor: pointer;
   }
   #new-chat:hover { background: #1d4fd6; }
+  #clear-all {
+    margin: 0 16px 12px; padding: 8px 12px; background: transparent; color: #ff7a7a;
+    border: 1px solid #2a2d38; border-radius: 8px; font-weight: 600; cursor: pointer;
+    font-size: 12px;
+  }
+  #clear-all:hover { background: #2a1520; border-color: #ff7a7a; }
   .sessions-label {
     font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
     color: #5a6173; padding: 4px 16px 6px;
@@ -317,6 +349,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="sub">NorthBridge Health Network</div>
   </div>
   <button id="new-chat" type="button">+ New chat</button>
+  <button id="clear-all" type="button">🗑 Clear all</button>
   <div class="sessions-label">Chats</div>
   <div id="sessions"></div>
 </div>
@@ -368,12 +401,14 @@ function loadState() {
 }
 // Merge with whatever other tabs have written so concurrent tabs don't clobber
 // each other's chats (union by id; our in-memory copy wins for shared ids).
-function saveState() {
-  let disk = { sessions: [] };
-  try { disk = JSON.parse(localStorage.getItem(STORE_KEY)) || disk; } catch (e) {}
-  const ourIds = new Set(state.sessions.map(s => s.id));
-  const extras = (disk.sessions || []).filter(s => !ourIds.has(s.id));
-  state.sessions = state.sessions.concat(extras);
+function saveState(skipMerge) {
+  if (!skipMerge) {
+    let disk = { sessions: [] };
+    try { disk = JSON.parse(localStorage.getItem(STORE_KEY)) || disk; } catch (e) {}
+    const ourIds = new Set(state.sessions.map(s => s.id));
+    const extras = (disk.sessions || []).filter(s => !ourIds.has(s.id));
+    state.sessions = state.sessions.concat(extras);
+  }
   localStorage.setItem(STORE_KEY, JSON.stringify(state));
 }
 function activeSession() { return state.sessions.find(s => s.id === state.activeId) || null; }
@@ -538,6 +573,26 @@ personaSel.addEventListener('change', () => {
 
 newChatBtn.addEventListener('click', () => newChat(personaSel.value || defaultPersona));
 
+document.getElementById('clear-all').addEventListener('click', () => {
+  if (!confirm('Delete all chats?')) return;
+  state.sessions = [];
+  state.activeId = null;
+  localStorage.removeItem(STORE_KEY);
+  // Create one fresh chat without merging old sessions back from disk.
+  const s = {
+    id: newId(),
+    persona: defaultPersona || personaSel.value,
+    title: 'New chat',
+    html: '',
+  };
+  state.sessions = [s];
+  state.activeId = s.id;
+  saveState(true);
+  renderSidebar();
+  renderActive();
+  q.focus();
+});
+
 // ---- send ----------------------------------------------------------------- //
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -569,7 +624,7 @@ form.addEventListener('submit', async (e) => {
     const r = await fetch('/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: text, persona: persona }),
+      body: JSON.stringify({ question: text, persona: persona, session_id: s.id }),
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
