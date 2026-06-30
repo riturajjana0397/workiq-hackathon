@@ -54,6 +54,8 @@ import time
 from pathlib import Path
 
 from openai import AsyncOpenAI
+import httpx
+
 from azure.identity.aio import AzureCliCredential, get_bearer_token_provider
 
 # Microsoft Agent Framework imports — verified against the installed version.
@@ -75,7 +77,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 MCP_SCRIPT = REPO_ROOT / "simulator" / "server.py"
 
-FOUNDRY_ENDPOINT = os.environ.get(
+FOUNDRY_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get(
     "AZURE_AI_FOUNDRY_ENDPOINT",
     "https://iqs-ai-nqgxoe2zunc6q.openai.azure.com/openai/v1",
 )
@@ -123,19 +125,20 @@ Honesty & governance:
 # Foundry client (Entra ID, no keys)                                           #
 # ---------------------------------------------------------------------------- #
 
-def build_chat_client() -> tuple[OpenAIChatClient, AzureCliCredential]:
+def build_chat_client() -> OpenAIChatClient:
     """Construct an OpenAI-compatible chat client backed by Azure AI Foundry.
 
-    Uses AzureCliCredential explicitly (instead of DefaultAzureCredential) so the
-    identity matches whatever `az account show` reports. DefaultAzureCredential
-    walks a chain (env vars -> Workload Identity -> VS Code -> shared cache ->
-    az CLI) and frequently returns a token from the WRONG tenant when any of
-    the earlier sources are signed into a different tenant. Switching to
-    AzureCliCredential makes the auth deterministic.
+    Auth: AzureCliCredential -> bearer token provider against
+    https://ai.azure.com/.default. Tokens refresh automatically because the
+    openai SDK accepts a callable for `api_key`.
 
-    The openai SDK accepts a callable for `api_key`; the token provider is
-    invoked per request so tokens refresh automatically.
+    Endpoint comes from AZURE_OPENAI_ENDPOINT (or AZURE_AI_FOUNDRY_ENDPOINT).
     """
+    if not FOUNDRY_ENDPOINT:
+        raise RuntimeError(
+            "AZURE_OPENAI_ENDPOINT (or AZURE_AI_FOUNDRY_ENDPOINT) is not set. "
+            "Set it to your Foundry /openai/v1 endpoint."
+        )
     credential = AzureCliCredential()
     token_provider = get_bearer_token_provider(
         credential, "https://ai.azure.com/.default"
@@ -148,14 +151,14 @@ def build_chat_client() -> tuple[OpenAIChatClient, AzureCliCredential]:
         model=DEPLOYMENT,
         async_client=openai_client,
     )
-    return chat_client, credential
+    return chat_client
 
 
 # ---------------------------------------------------------------------------- #
 # Tool surfaces                                                                #
 # ---------------------------------------------------------------------------- #
 
-def build_mcp_tool() -> MCPStdioTool:
+def build_mcp_tool(persona: str | None = None) -> MCPStdioTool:
     """Spawn the local Work IQ MCP server as a child process and surface its
     tools to the model. Persona is injected via env so RBAC kicks in.
     """
@@ -177,21 +180,26 @@ def build_mcp_tool() -> MCPStdioTool:
         args=[str(MCP_SCRIPT)],
         env={
             **os.environ,
-            "WORKIQ_SIM_PERSONA": PERSONA,
+            "WORKIQ_SIM_PERSONA": persona or PERSONA,
             "WORKIQ_SIM_SCENARIO": SCENARIO,
         },
     )
 
 
-def build_a2a_agent() -> A2AAgent:
+def build_a2a_agent(persona: str | None = None) -> A2AAgent:
     """Wrap the running Work IQ A2A server as a sub-agent the orchestrator can
     delegate Chat-style questions to. The agent card is auto-discovered from
     /.well-known/agent-card.json under the given base URL.
+
+    When a persona is supplied, it is sent on every request via the
+    X-WorkIQ-Persona header so the remote A2A server applies the right RBAC.
     """
     # A2AAgent wants the BASE URL of the remote agent (it appends the card path
     # and the /a2a/ endpoint itself). Derive it from WORKIQ_A2A_CARD by stripping
     # the well-known suffix.
     base_url = A2A_CARD_URL.split("/.well-known/", 1)[0]
+    headers = {"X-WorkIQ-Persona": persona or PERSONA}
+    http_client = httpx.AsyncClient(headers=headers, timeout=60.0)
     return A2AAgent(
         name="workiq-a2a",
         description=(
@@ -199,6 +207,7 @@ def build_a2a_agent() -> A2AAgent:
             "receive a finished, cited natural-language answer."
         ),
         url=base_url,
+        http_client=http_client,
     )
 
 
@@ -208,7 +217,7 @@ def build_a2a_agent() -> A2AAgent:
 
 async def run(question: str | None) -> None:
     telemetry = setup_telemetry("workiq-agent")
-    chat_client, credential = build_chat_client()
+    chat_client = build_chat_client()
 
     mcp_tool = build_mcp_tool()
     a2a_agent = build_a2a_agent()
@@ -240,8 +249,7 @@ async def run(question: str | None) -> None:
                 break
             await _ask_and_print(agent, user, telemetry)
 
-    # azure.identity.aio credentials hold an aiohttp session.
-    await credential.close()
+
 
 
 async def _ask_and_print(agent: Agent, question: str, telemetry) -> None:
