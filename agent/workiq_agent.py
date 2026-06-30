@@ -47,8 +47,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from openai import AsyncOpenAI
@@ -61,6 +63,11 @@ from agent_framework import Agent, MCPStdioTool
 from agent_framework.openai import OpenAIChatClient
 from agent_framework_a2a import A2AAgent
 
+from telemetry import record_usage, setup_telemetry, span_context_attributes
+
+
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------- #
 # Configuration                                                                #
@@ -71,7 +78,8 @@ VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 MCP_SCRIPT = REPO_ROOT / "simulator" / "server.py"
 
 FOUNDRY_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get(
-    "AZURE_AI_FOUNDRY_ENDPOINT", ""
+    "AZURE_AI_FOUNDRY_ENDPOINT",
+    "https://iqs-ai-nqgxoe2zunc6q.openai.azure.com/openai/v1",
 )
 DEPLOYMENT = os.environ.get("AZURE_AI_FOUNDRY_DEPLOYMENT", "gpt-4o-mini")
 PERSONA = os.environ.get("WORKIQ_SIM_PERSONA", "quality_pm")
@@ -243,6 +251,7 @@ def build_a2a_agent(persona: str | None = None) -> A2AAgent:
 # ---------------------------------------------------------------------------- #
 
 async def run(question: str | None) -> None:
+    telemetry = setup_telemetry("workiq-agent")
     chat_client = build_chat_client()
 
     mcp_tool = build_mcp_tool()
@@ -258,22 +267,11 @@ async def run(question: str | None) -> None:
             tools=[mcp_tool, a2a_agent.as_tool()],
         )
 
-        banner = (
-            f"\nWork IQ orchestrator ready.\n"
-            f"  Foundry deployment : {DEPLOYMENT}\n"
-            f"  Persona            : {PERSONA}\n"
-            f"  Scenario           : {SCENARIO}\n"
-            f"  MCP child          : {MCP_SCRIPT.name}\n"
-            f"  A2A card           : {A2A_CARD_URL}\n"
-        )
-        print(banner)
-
         if question:
-            await _ask_and_print(agent, question)
+            await _ask_and_print(agent, question, telemetry)
             return
 
         # REPL
-        print("Type a question, or '/quit' to exit.")
         while True:
             try:
                 user = input("\nask> ").strip()
@@ -284,17 +282,52 @@ async def run(question: str | None) -> None:
                 continue
             if user in ("/quit", "/exit"):
                 break
-            await _ask_and_print(agent, user)
+            await _ask_and_print(agent, user, telemetry)
 
 
 
 
-async def _ask_and_print(agent: Agent, question: str) -> None:
-    print("\n--- agent reasoning ---")
-    response = await agent.run(question)
-    # The framework returns a message-like object; render its text payload.
-    text = getattr(response, "text", None) or getattr(response, "content", None) or str(response)
-    print(text)
+async def _ask_and_print(agent: Agent, question: str, telemetry) -> None:
+    logger.info("user submitted question: %s", question)
+    started = time.perf_counter()
+    with telemetry.tracer.start_as_current_span(
+        "workiq.agent.turn",
+        attributes=span_context_attributes(
+            service="workiq-agent",
+            scenario=SCENARIO,
+            persona=PERSONA,
+            deployment=DEPLOYMENT,
+            question=question,
+            question_chars=len(question),
+        ),
+    ) as span:
+        try:
+            response = await agent.run(question)
+            usage = record_usage(telemetry, response, span)
+            # The framework returns a message-like object; render its text payload.
+            text = (
+                getattr(response, "text", None)
+                or getattr(response, "content", None)
+                or str(response)
+            )
+            print(text)
+        except Exception:
+            telemetry.failures.add(1)
+            span.record_exception(sys.exc_info()[1])
+            raise
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            telemetry.requests.add(1)
+            telemetry.latency_ms.record(
+                elapsed_ms,
+                attributes=span_context_attributes(
+                    service="workiq-agent",
+                    scenario=SCENARIO,
+                    persona=PERSONA,
+                    deployment=DEPLOYMENT,
+                ),
+            )
+            span.set_attribute("workiq.request.duration_ms", elapsed_ms)
 
 
 def main() -> int:

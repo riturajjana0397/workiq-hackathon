@@ -24,12 +24,14 @@ Same as workiq_agent.py:
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+import time
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -49,6 +51,11 @@ from workiq_agent import (  # noqa: E402
     build_chat_client,
     build_mcp_tool,
 )
+from telemetry import (
+    record_usage,
+    setup_telemetry,
+    span_context_attributes,
+)  # noqa: E402
 from agent_framework import AgentSession  # noqa: E402
 
 # Load scenario data for citation lookup
@@ -59,12 +66,17 @@ _scenario = load_scenario(REPO_ROOT / "simulator" / SCENARIO)
 
 
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------- #
 # Lifespan: build the agent once, tear it down cleanly on shutdown.            #
 # ---------------------------------------------------------------------------- #
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    telemetry = setup_telemetry("workiq-web")
+    app.state._telemetry = telemetry
     # One chat client shared by every persona's agent.
     app.state.chat_client = build_chat_client()
     # persona id -> {"agent", "mcp", "a2a"} built lazily on first use.
@@ -157,10 +169,6 @@ async def get_persona_agent(app: FastAPI, persona: str):
 app = FastAPI(title="Work IQ Orchestrator UI", lifespan=lifespan)
 
 
-# ---------------------------------------------------------------------------- #
-# API                                                                           #
-# ---------------------------------------------------------------------------- #
-
 class AskRequest(BaseModel):
     question: str
     persona: str | None = None
@@ -184,43 +192,88 @@ async def personas() -> dict:
 
 
 @app.post("/ask")
-async def ask(req: AskRequest) -> dict:
+async def ask(req: AskRequest, request: Request) -> dict:
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="question is required")
 
+    telemetry = request.app.state._telemetry
     persona = (req.persona or PERSONA).strip()
-    agent = await get_persona_agent(app, persona)
+    agent = await get_persona_agent(request.app, persona)
 
-    # Get or create a session for conversation memory
+    # Get or create a session for conversation memory.
     session_id = req.session_id or "default"
     session_key = f"{persona}:{session_id}"
-    if session_key not in app.state.sessions:
-        app.state.sessions[session_key] = AgentSession(session_id=session_key)
-    session = app.state.sessions[session_key]
+    if session_key not in request.app.state.sessions:
+        request.app.state.sessions[session_key] = AgentSession(session_id=session_key)
+    session = request.app.state.sessions[session_key]
 
-    response = await agent.run(q, session=session)
-    text = (
-        getattr(response, "text", None)
-        or getattr(response, "content", None)
-        or str(response)
-    )
+    started = time.perf_counter()
+    elapsed_ms = 0.0
+    usage: dict[str, int] = {}
+    answer_text = ""
+    try:
+        with telemetry.tracer.start_as_current_span(
+            "workiq.web.ask",
+            attributes=span_context_attributes(
+                service="workiq-web",
+                scenario=SCENARIO,
+                persona=persona,
+                deployment=DEPLOYMENT,
+                question=q,
+                question_chars=len(q),
+            ),
+        ) as span:
+            response = await agent.run(q, session=session)
+            usage = record_usage(telemetry, response, span)
+            answer_text = (
+                getattr(response, "text", None)
+                or getattr(response, "content", None)
+                or str(response)
+            )
+            if usage:
+                span.set_attribute("workiq.total_tokens", usage.get("total_tokens", 0))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        telemetry.failures.add(1)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        telemetry.requests.add(1)
+        telemetry.latency_ms.record(
+            elapsed_ms,
+            attributes=span_context_attributes(
+                service="workiq-web",
+                scenario=SCENARIO,
+                persona=persona,
+                deployment=DEPLOYMENT,
+            ),
+        )
 
-    # Post-process: convert bare citation IDs (e.g. MTG-001, EML-002) into
-    # clickable simulator links so the UI can render them.
-    # Skip IDs already inside markdown links (preceded by / or [).
+    # Convert bare citation IDs into links for the UI.
     import re
+
     def _linkify_citation(m):
         cid = m.group(0)
         entry = _scenario.index.get(cid)
         if entry:
             kind, _rec = entry
-            title = cid
-            return f"[{title}](https://simulator.local/{kind}/{cid})"
+            return f"[{cid}](https://simulator.local/{kind}/{cid})"
         return cid
-    text = re.sub(r'(?<![/\[])\b(MTG|EML|MSG|FILE|PPL|CAPA|AI)-\d{3}\b(?!\])', _linkify_citation, text)
 
-    return {"answer": text, "persona": persona}
+    answer_text = re.sub(
+        r"(?<![/\[] )\b(MTG|EML|MSG|FILE|PPL|CAPA|AI)-\d{3}\b(?!\])".replace(" ", ""),
+        _linkify_citation,
+        answer_text,
+    )
+
+    return {
+        "answer": answer_text,
+        "persona": persona,
+        "usage": usage,
+        "latency_ms": round(elapsed_ms, 2),
+    }
 
 
 # ---------------------------------------------------------------------------- #
@@ -328,6 +381,41 @@ INDEX_HTML = r"""<!doctype html>
     padding: 0 18px; font-weight: 600; cursor: pointer;
   }
   button:disabled { background: #3a3f4f; cursor: not-allowed; }
+  #usage {
+    position: fixed; right: 16px; bottom: 16px; z-index: 20;
+    width: 240px; background: rgba(18, 22, 31, 0.96);
+    border: 1px solid #2a2d38; border-radius: 12px;
+    padding: 12px 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+    backdrop-filter: blur(10px);
+    font-size: 12px; line-height: 1.45;
+  }
+  #usage .title { color: #9cc7ff; font-weight: 700; margin-bottom: 6px; }
+  #usage .row { display: flex; justify-content: space-between; gap: 12px; }
+  #usage .label {
+    color: #8a8f9c;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  #usage .value { color: #e6e6e6; font-variant-numeric: tabular-nums; }
+  #usage .hint { margin-top: 8px; color: #8a8f9c; }
+  #usage .info {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border-radius: 999px;
+    border: 1px solid #5a6173;
+    color: #9cc7ff;
+    font-size: 10px;
+    line-height: 1;
+    cursor: help;
+    flex: 0 0 auto;
+  }
+  @media (max-width: 780px) {
+    #usage { left: 16px; right: 16px; bottom: 76px; width: auto; }
+  }
   header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
   .persona-box { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
   .persona-box label { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: #5a6173; }
@@ -370,10 +458,20 @@ INDEX_HTML = r"""<!doctype html>
 
   <div id="log"></div>
 
-  <form id="form">
-    <textarea id="q" placeholder="Ask something — e.g. 'what's the status of the Westgate EHR rollout?'" required></textarea>
-    <button id="send" type="submit">Send</button>
-  </form>
+<aside id="usage" aria-live="polite">
+  <div class="title">Usage this session</div>
+  <div class="row"><span class="label">Turns <span class="info" title="How many questions you have sent in this session.">i</span></span><span class="value" id="u-turns">0</span></div>
+  <div class="row"><span class="label">Prompt tokens <span class="info" title="Tokens in your question and conversation context sent to the model.">i</span></span><span class="value" id="u-prompt">0</span></div>
+  <div class="row"><span class="label">Completion tokens <span class="info" title="Tokens generated by the model in its answer.">i</span></span><span class="value" id="u-completion">0</span></div>
+  <div class="row"><span class="label">Total tokens <span class="info" title="Prompt tokens + completion tokens for the turn.">i</span></span><span class="value" id="u-total">0</span></div>
+  <div class="row"><span class="label">Last latency <span class="info" title="How long the most recent request took end to end.">i</span></span><span class="value" id="u-latency">0 ms</span></div>
+  <div class="hint">Use this as a proxy for model credits consumed.</div>
+</aside>
+
+<form id="form">
+  <textarea id="q" placeholder="Ask something — e.g. 'what's blocking PPAP qualification?'" required></textarea>
+  <button id="send" type="submit">Send</button>
+</form>
 </div>
 
 <script>
@@ -388,6 +486,17 @@ const sessionsEl = document.getElementById('sessions');
 const newChatBtn = document.getElementById('new-chat');
 const chatTitle  = document.getElementById('chat-title');
 const chatSub    = document.getElementById('chat-sub');
+const usageState = {
+  turns: 0,
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+};
+const uTurns = document.getElementById('u-turns');
+const uPrompt = document.getElementById('u-prompt');
+const uCompletion = document.getElementById('u-completion');
+const uTotal = document.getElementById('u-total');
+const uLatency = document.getElementById('u-latency');
 
 const STORE_KEY = 'workiq_sessions_v2';
 let personaList = [];
@@ -571,6 +680,13 @@ personaSel.addEventListener('change', () => {
   }
 });
 
+function refreshUsage(latencyMs) {
+  uTurns.textContent = String(usageState.turns);
+  uPrompt.textContent = String(usageState.promptTokens);
+  uCompletion.textContent = String(usageState.completionTokens);
+  uTotal.textContent = String(usageState.totalTokens);
+  uLatency.textContent = Number.isFinite(latencyMs) ? `${latencyMs.toFixed(0)} ms` : '0 ms';
+}
 newChatBtn.addEventListener('click', () => newChat(personaSel.value || defaultPersona));
 
 document.getElementById('clear-all').addEventListener('click', () => {
@@ -626,10 +742,24 @@ form.addEventListener('submit', async (e) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question: text, persona: persona, session_id: s.id }),
     });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+    const raw = await r.text();
+    let data = null;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      data = null;
+    }
+    if (!r.ok) {
+      throw new Error((data && data.detail) || raw || ('HTTP ' + r.status));
+    }
+    const turnUsage = (data && data.usage) || {};
+    usageState.turns += 1;
+    usageState.promptTokens += Number(turnUsage.prompt_tokens || 0);
+    usageState.completionTokens += Number(turnUsage.completion_tokens || 0);
+    usageState.totalTokens += Number(turnUsage.total_tokens || 0);
+    refreshUsage(Number(data && data.latency_ms));
     placeholder.classList.remove('thinking');
-    let answer = (data.answer || '(no answer)').replace(/https:\/\/simulator\.local\//g, '/citation/');
+    let answer = ((data && data.answer) || raw || '(no answer)').replace(/https:\/\/simulator\.local\//g, '/citation/');
     placeholder.innerHTML = marked.parse(answer);
     placeholder.querySelectorAll('a[href^="/citation/"]').forEach(a => a.target = '_blank');
   } catch (err) {
@@ -721,6 +851,7 @@ async def citation_detail(kind: str, cid: str) -> str:
 # ---------------------------------------------------------------------------- #
 # Entrypoint                                                                    #
 # ---------------------------------------------------------------------------- #
+
 
 def main() -> int:
     uvicorn.run(
