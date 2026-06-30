@@ -99,7 +99,7 @@ def create_entity(table: str, record: dict[str, Any]) -> str:
     row (same id, or same milestone+owner) returns the existing row instead of
     duplicating. Returns JSON describing whether a row was created."""
     try:
-        res = engine.create_entity(SCENARIO, table, record, persist=False)
+        res = engine.create_entity(SCENARIO, table, record, persist=True)
     except ValueError as e:
         return _table_error(e)
     return json.dumps(res, indent=2)
@@ -110,7 +110,7 @@ def update_entity(table: str, id: str, patch: dict[str, Any]) -> str:
     """Patch fields on an existing row (by id) in a Work IQ Tools-backed table — e.g.
     move a milestone date or change a status. Returns JSON describing the update."""
     try:
-        res = engine.update_entity(SCENARIO, table, id, patch, persist=False)
+        res = engine.update_entity(SCENARIO, table, id, patch, persist=True)
     except ValueError as e:
         return _table_error(e)
     return json.dumps(res, indent=2)

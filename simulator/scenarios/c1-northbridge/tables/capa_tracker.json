@@ -1,16 +1,19 @@
 {
-  "_comment": "Dataverse/connector-style corrective-action (CAPA) tracker for Northbridge Health Network. This is the fetch / update_entity / create_entity target for the 'Agent with MCP / Tools' tier. The C2 hero Tools action is update_entity: change a corrective action's status and set the past_due flag. Rows carry their own acl — CAPA-005 is an HR-sensitive matter restricted to the credentialing lead and operations director. Reference 'today' is mid-June 2026, so items with a due date before 12-JUN that are not Closed are past due.",
   "capa_tracker": [
     {
       "id": "CAPA-001",
       "action": "Finalise and publish the revised medication-reconciliation policy",
       "committee": "quality_steering",
       "owner": "PPL-005",
-      "status": "Open",
+      "status": "Flagged",
       "opened_date": "2026-05-27",
       "due_date": "2026-06-09",
-      "past_due": true,
-      "acl": ["ops_director", "quality_pm", "credentialing_lead"]
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ]
     },
     {
       "id": "CAPA-002",
@@ -21,7 +24,11 @@
       "opened_date": "2026-05-15",
       "due_date": "2026-06-06",
       "past_due": false,
-      "acl": ["ops_director", "quality_pm", "credentialing_lead"]
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ]
     },
     {
       "id": "CAPA-003",
@@ -32,18 +39,26 @@
       "opened_date": "2026-06-01",
       "due_date": "2026-06-13",
       "past_due": false,
-      "acl": ["ops_director", "quality_pm", "credentialing_lead"]
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ]
     },
     {
       "id": "CAPA-004",
       "action": "Complete Westgate environment-of-care documentation for Joint Commission",
       "committee": "quality_steering",
       "owner": "PPL-007",
-      "status": "Open",
+      "status": "Flagged",
       "opened_date": "2026-05-27",
       "due_date": "2026-06-06",
-      "past_due": true,
-      "acl": ["ops_director", "quality_pm", "credentialing_lead"]
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ]
     },
     {
       "id": "CAPA-005",
@@ -54,7 +69,40 @@
       "opened_date": "2026-05-20",
       "due_date": "2026-06-05",
       "past_due": false,
-      "acl": ["credentialing_lead", "ops_director"]
+      "acl": [
+        "credentialing_lead",
+        "ops_director"
+      ]
+    },
+    {
+      "action": "Conduct post-go-live EHR user satisfaction survey at Westgate",
+      "committee": "ehr_program",
+      "owner": "PPL-004",
+      "status": "Open",
+      "opened_date": "2026-06-28",
+      "due_date": "2026-07-15",
+      "past_due": false,
+      "id": "CAPA-006",
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ]
+    },
+    {
+      "action": "Conduct post-go-live EHR user satisfaction survey at Westgate",
+      "committee": "ehr_program",
+      "owner": "PPL-004",
+      "status": "Open",
+      "opened_date": "2026-06-28",
+      "due_date": "2026-07-15",
+      "past_due": false,
+      "id": "CAPA-007",
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ]
     }
   ]
 }
