@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 # --------------------------------------------------------------------------- #
 # Fixture loading
@@ -424,6 +426,22 @@ def _all_snippets(sc: Scenario, persona_id: str | None) -> list[dict]:
 
 
 def _retrieve(snippets: list[dict], question: str, k: int = 6) -> list[dict]:
+    """Retrieve top-k snippets using cosine similarity on embeddings if available,
+    falling back to term-overlap if no embedding endpoint is configured."""
+    embeddings = _get_embeddings([s["text"] for s in snippets] + [question])
+    if embeddings is not None:
+        snippet_vecs = embeddings[:-1]
+        query_vec = embeddings[-1]
+        # Cosine similarity
+        norms = np.linalg.norm(snippet_vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        snippet_normed = snippet_vecs / norms
+        query_norm = query_vec / (np.linalg.norm(query_vec) or 1)
+        scores = snippet_normed @ query_norm
+        top_indices = np.argsort(scores)[::-1][:k]
+        return [snippets[i] for i in top_indices if scores[i] > 0]
+
+    # Fallback: term overlap
     q_terms = set(_normalize(question).split())
     scored = []
     for s in snippets:
@@ -433,6 +451,39 @@ def _retrieve(snippets: list[dict], question: str, k: int = 6) -> list[dict]:
             scored.append((overlap, s))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [s for _, s in scored[:k]]
+
+
+def _get_embeddings(texts: list[str]):
+    """Get embeddings from Azure OpenAI. Returns numpy array or None if unavailable."""
+    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
+    if not endpoint:
+        return None
+    # Strip /openai/v1 suffix if present to get the base endpoint
+    base = re.sub(r"/openai/v1$", "", endpoint)
+    deploy = os.environ.get("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-ada-002")
+    api_version = "2024-02-01"
+    url = f"{base}/openai/deployments/{deploy}/embeddings?api-version={api_version}"
+
+    try:
+        import httpx
+        from azure.identity import AzureCliCredential
+        credential = AzureCliCredential()
+        token = credential.get_token("https://cognitiveservices.azure.com/.default").token
+        resp = httpx.post(
+            url,
+            json={"input": texts},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            print(f"[engine] embedding request failed ({resp.status_code}): {resp.text[:200]}", file=sys.stderr)
+            return None
+        data = resp.json()
+        vecs = [item["embedding"] for item in data["data"]]
+        return np.array(vecs, dtype=np.float32)
+    except Exception as exc:
+        print(f"[engine] embedding fallback to term-overlap: {exc}", file=sys.stderr)
+        return None
 
 
 # --------------------------------------------------------------------------- #
