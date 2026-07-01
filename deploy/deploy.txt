@@ -1,9 +1,12 @@
 =====================================build,push,deploy================================================================
 
 
-$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-web:latest -f deploy/AgentWebUI/Dockerfile .; docker tag workiq-web:latest ${ACR}/workiq-web:${TAG}; docker push ${ACR}/workiq-web:${TAG}
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-a2a:$TAG -f deploy/A2AAgent/Dockerfile .; docker tag workiq-a2a:$TAG ${ACR}/workiq-a2a:${TAG}; docker push ${ACR}/workiq-a2a:${TAG}
 
-$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-a2a:latest -f deploy/A2AAgent/Dockerfile .; docker tag workiq-a2a:latest ${ACR}/workiq-a2a:${TAG}; docker push ${ACR}/workiq-a2a:${TAG}
+
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-web:$TAG -f deploy/AgentWebUI/Dockerfile .; docker tag workiq-web:$TAG ${ACR}/workiq-web:${TAG}; docker push ${ACR}/workiq-web:${TAG}
+
+
 =======================================================================================================
 
 
