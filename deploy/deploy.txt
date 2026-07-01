@@ -1,14 +1,67 @@
-
-
-docker build -t workiq-web:$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -f deploy/AgentWebUI/Dockerfile .
-
-docker build -t workiq-web:$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -f deploy/A2AAgent/Dockerfile .
-
 =====================================build,push,deploy================================================================
 
 
-$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $REPO="workiq-web"; $TAG="$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"; docker tag ${REPO}:latest ${ACR}/${REPO}:$TAG; docker push ${ACR}/${REPO}:$TAG
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG="latest"; docker build --platform linux/amd64 -t workiq-web:latest -f deploy/AgentWebUI/Dockerfile .; docker tag workiq-web:latest ${ACR}/workiq-web:${TAG}; docker push ${ACR}/workiq-web:${TAG}
 
-$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $REPO="workiq-a2a"; $TAG="$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"; docker tag ${REPO}:latest ${ACR}/${REPO}:$TAG; docker push ${ACR}/${REPO}:$TAG
-
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG="latest"; docker build --platform linux/amd64 -t workiq-a2a:latest -f deploy/A2AAgent/Dockerfile .; docker tag workiq-a2a:latest ${ACR}/workiq-a2a:${TAG}; docker push ${ACR}/workiq-a2a:${TAG}
 =======================================================================================================
+
+
+
+
+
+Run:
+az login
+az group create -n %RG% -l %LOC%
+az acr create -n %ACR% -g %RG% --sku Basic
+az containerapp env create -n %ENV% -g %RG% -l %LOC%
+
+Step 6: Push images to ACR
+az acr login -n %ACR%
+
+docker tag workiq-web:latest %ACR%.azurecr.io/workiq-web:latest
+docker tag workiq-a2a:latest %ACR%.azurecr.io/workiq-a2a:latest
+
+docker push %ACR%.azurecr.io/workiq-web:latest
+docker push %ACR%.azurecr.io/workiq-a2a:latest
+
+Step 7: Deploy A2A app first
+az containerapp create ^
+-n workiq-a2a ^
+-g %RG% ^
+--environment %ENV% ^
+--image %ACR%.azurecr.io/workiq-a2a:latest ^
+--target-port 8920 ^
+--ingress external ^
+--registry-server %ACR%.azurecr.io ^
+--query properties.configuration.ingress.fqdn -o tsv
+
+Save the returned FQDN as A2A_FQDN.
+
+Step 8: Deploy web app
+You must provide your Foundry settings and point WORKIQ_A2A_CARD to A2A app:
+
+az containerapp create ^
+-n workiq-web ^
+-g %RG% ^
+--environment %ENV% ^
+--image %ACR%.azurecr.io/workiq-web:latest ^
+--target-port 8000 ^
+--ingress external ^
+--registry-server %ACR%.azurecr.io ^
+--env-vars ^
+AZURE_OPENAI_ENDPOINT="https://<your-endpoint>/openai/v1" ^
+AZURE_AI_FOUNDRY_DEPLOYMENT="gpt-4o-mini" ^
+WORKIQ_SIM_PERSONA="quality_pm" ^
+WORKIQ_A2A_CARD="https://<A2A_FQDN>/.well-known/agent-card.json" ^
+AZURE_EXPERIMENTAL_ENABLE_GENAI_TRACING="true" ^
+APPLICATIONINSIGHTS_CONNECTION_STRING="<your-app-insights-connection-string>"
+
+Step 9: Verify
+Get URLs:
+az containerapp show -n workiq-web -g %RG% --query properties.configuration.ingress.fqdn -o tsv
+az containerapp show -n workiq-a2a -g %RG% --query properties.configuration.ingress.fqdn -o tsv
+
+Check logs:
+az containerapp logs show -n workiq-web -g %RG% --follow
+az containerapp logs show -n workiq-a2a -g %RG% --follow
