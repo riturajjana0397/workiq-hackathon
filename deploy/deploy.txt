@@ -4,3 +4,11 @@ docker build -t workiq-web:$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::Utc
 
 docker build -t workiq-web:$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -f deploy/A2AAgent/Dockerfile .
 
+=====================================build,push,deploy================================================================
+
+
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $REPO="workiq-web"; $TAG="$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"; docker tag ${REPO}:latest ${ACR}/${REPO}:$TAG; docker push ${ACR}/${REPO}:$TAG
+
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $REPO="workiq-a2a"; $TAG="$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"; docker tag ${REPO}:latest ${ACR}/${REPO}:$TAG; docker push ${ACR}/${REPO}:$TAG
+
+=======================================================================================================
