@@ -57,7 +57,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 import httpx
 
-from azure.identity.aio import AzureCliCredential, get_bearer_token_provider
+from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
 
 # Microsoft Agent Framework imports — verified against the installed version.
 from agent_framework import Agent, MCPStdioTool
@@ -163,7 +163,7 @@ Scope guardrail (STRICT):
 def build_chat_client() -> OpenAIChatClient:
     """Construct an OpenAI-compatible chat client backed by Azure AI Foundry.
 
-    Auth: AzureCliCredential -> bearer token provider against
+    Auth: DefaultAzureCredential -> bearer token provider against
     https://ai.azure.com/.default. Tokens refresh automatically because the
     openai SDK accepts a callable for `api_key`.
 
@@ -174,7 +174,7 @@ def build_chat_client() -> OpenAIChatClient:
             "AZURE_OPENAI_ENDPOINT (or AZURE_AI_FOUNDRY_ENDPOINT) is not set. "
             "Set it to your Foundry /openai/v1 endpoint."
         )
-    credential = AzureCliCredential()
+    credential = DefaultAzureCredential()
     token_provider = get_bearer_token_provider(
         credential, "https://ai.azure.com/.default"
     )
