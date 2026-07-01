@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -1268,10 +1269,12 @@ async def citation_detail(kind: str, cid: str) -> str:
 
 
 def main() -> int:
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(
         "web:app",
-        host="127.0.0.1",
-        port=8000,
+        host=host,
+        port=port,
         reload=False,
         log_level="info",
     )
