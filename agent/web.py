@@ -27,6 +27,8 @@ import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 import time
 
@@ -56,7 +58,7 @@ from telemetry import (
     setup_telemetry,
     span_context_attributes,
 )  # noqa: E402
-from agent_framework import AgentSession  # noqa: E402
+from agent_framework import AgentSession, function_middleware  # noqa: E402
 
 # Load scenario data for citation lookup
 sys.path.insert(0, str(REPO_ROOT / "simulator"))
@@ -67,6 +69,50 @@ _scenario = load_scenario(REPO_ROOT / "simulator" / SCENARIO)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate_text(value: str, limit: int = 220) -> str:
+  if len(value) <= limit:
+    return value
+  return value[: limit - 1] + "..."
+
+
+def _json_safe(value):
+  """Convert runtime objects into JSON-serializable, compact values."""
+  if value is None or isinstance(value, (str, int, float, bool)):
+    return value
+  if isinstance(value, Decimal):
+    return float(value)
+  if isinstance(value, dict):
+    return {str(k): _json_safe(v) for k, v in value.items()}
+  if isinstance(value, (list, tuple, set)):
+    return [_json_safe(v) for v in value]
+  # Handle Content objects from agent_framework
+  if hasattr(value, "text") and hasattr(value, "content_type"):
+    try:
+      return _json_safe({"text": getattr(value, "text", ""), "content_type": getattr(value, "content_type", "unknown")})
+    except Exception:
+      pass
+  # Handle dataclass or Pydantic models
+  if hasattr(value, "model_dump"):
+    try:
+      return _json_safe(value.model_dump())
+    except Exception:
+      pass
+  if hasattr(value, "dict"):
+    try:
+      return _json_safe(value.dict())
+    except Exception:
+      pass
+  # For objects with __dict__, try to extract readable attributes
+  if hasattr(value, "__dict__"):
+    try:
+      attrs = {k: _json_safe(v) for k, v in value.__dict__.items() if not k.startswith("_")}
+      if attrs:
+        return attrs
+    except Exception:
+      pass
+  return _truncate_text(str(value), 400)
 
 # ---------------------------------------------------------------------------- #
 # Lifespan: build the agent once, tear it down cleanly on shutdown.            #
@@ -212,6 +258,43 @@ async def ask(req: AskRequest, request: Request) -> dict:
     elapsed_ms = 0.0
     usage: dict[str, int] = {}
     answer_text = ""
+    tool_trail: list[dict] = []
+    turn_started_at = datetime.now(timezone.utc).isoformat()
+
+    @function_middleware
+    async def _tool_trace_middleware(context, call_next):
+      tool_started = time.perf_counter()
+      call_id = context.metadata.get("call_id")
+      args = _json_safe(context.arguments)
+      status = "ok"
+      error = None
+      try:
+        await call_next()
+      except Exception as exc:
+        status = "error"
+        error = str(exc)
+        raise
+      finally:
+        duration_ms = (time.perf_counter() - tool_started) * 1000
+        result_obj = getattr(context, "result", None)
+        result_serialized = _json_safe(result_obj)
+        result_preview = _truncate_text(
+          str(result_serialized) if result_serialized is not None else "",
+          220
+        )
+        tool_trail.append(
+          {
+            "index": len(tool_trail) + 1,
+            "tool": context.function.name,
+            "call_id": call_id,
+            "status": status,
+            "duration_ms": round(duration_ms, 2),
+            "args": args,
+            "result_preview": result_preview,
+            "error": _truncate_text(error, 220) if error else None,
+          }
+        )
+
     try:
         with telemetry.tracer.start_as_current_span(
             "workiq.web.ask",
@@ -224,7 +307,11 @@ async def ask(req: AskRequest, request: Request) -> dict:
                 question_chars=len(q),
             ),
         ) as span:
-            response = await agent.run(q, session=session)
+            response = await agent.run(
+              q,
+              session=session,
+              client_kwargs={"middleware": [_tool_trace_middleware]},
+            )
             usage = record_usage(telemetry, response, span)
             answer_text = (
                 getattr(response, "text", None)
@@ -273,6 +360,8 @@ async def ask(req: AskRequest, request: Request) -> dict:
         "persona": persona,
         "usage": usage,
         "latency_ms": round(elapsed_ms, 2),
+      "trail": tool_trail,
+      "turn_started_at": turn_started_at,
     }
 
 
@@ -428,6 +517,169 @@ INDEX_HTML = r"""<!doctype html>
   #persona-desc { font-size: 11px; color: #8a8f9c; max-width: 360px; text-align: right; }
   #persona-lock { font-size: 10px; color: #d9a441; }
   .empty-state { color: #5a6173; text-align: center; margin-top: 80px; font-size: 14px; }
+  .trail-row {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px dashed #2f3445;
+    font-size: 12px;
+    color: #8a8f9c;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .trail-row .trail-num {
+    border: 1px solid #355aa0;
+    background: #1a2f56;
+    color: #9cc7ff;
+    border-radius: 999px;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 8px;
+    font-size: 12px;
+    line-height: 22px;
+    cursor: pointer;
+    font-weight: 700;
+  }
+  .trail-row .trail-num:hover { background: #234277; }
+  .trail-row .trail-meta { color: #7f8697; }
+  #trail-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 40;
+    padding: 16px;
+  }
+  #trail-modal.open { display: flex; }
+  .trail-panel {
+    width: min(840px, 100%);
+    max-height: 82vh;
+    overflow: auto;
+    background: #111623;
+    border: 1px solid #2a2d38;
+    border-radius: 12px;
+    box-shadow: 0 20px 44px rgba(0, 0, 0, 0.45);
+  }
+  .trail-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 16px;
+    border-bottom: 1px solid #252a36;
+  }
+  .trail-head h3 { margin: 0; font-size: 15px; }
+  .trail-close {
+    border: 1px solid #3a4051;
+    background: transparent;
+    color: #cfd4e3;
+    border-radius: 8px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  .trail-body { padding: 14px 16px 16px; }
+  .trail-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .trail-kpi {
+    background: #161b29;
+    border: 1px solid #2a2f3d;
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .trail-kpi .k { color: #8a8f9c; font-size: 11px; }
+  .trail-kpi .v { color: #e6e6e6; font-weight: 700; margin-top: 2px; }
+  .call {
+    border: 1px solid #2a2f3d;
+    background: #151a27;
+    border-radius: 10px;
+    padding: 10px;
+    margin-top: 10px;
+  }
+  .call-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .call-title { color: #9cc7ff; font-weight: 700; }
+  .call-time { color: #d9e3f8; font-variant-numeric: tabular-nums; }
+  .call pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #0d111b;
+    border: 1px solid #252a36;
+    padding: 8px;
+    border-radius: 8px;
+    color: #cfd4e3;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .json-section {
+    margin-top: 8px;
+    background: #0d111b;
+    border: 1px solid #252a36;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .json-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    background: #161b29;
+    border-bottom: 1px solid #252a36;
+    cursor: pointer;
+    user-select: none;
+  }
+  .json-header:hover { background: #1c2235; }
+  .json-toggle {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    line-height: 14px;
+    text-align: center;
+    color: #8a8f9c;
+    font-size: 10px;
+  }
+  .json-header.collapsed .json-toggle::after { content: '▶'; }
+  .json-header:not(.collapsed) .json-toggle::after { content: '▼'; }
+  .json-header-label { font-size: 12px; color: #9cc7ff; font-weight: 600; }
+  .json-body {
+    padding: 10px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .json-header.collapsed ~ .json-body { display: none; }
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .status-ok {
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+  }
+  .status-error {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+  }
+  .status-ok::before { content: '✓'; }
+  .status-error::before { content: '✕'; }
 </style>
 </head>
 <body>
@@ -474,6 +726,16 @@ INDEX_HTML = r"""<!doctype html>
 </form>
 </div>
 
+<div id="trail-modal" aria-hidden="true" role="dialog" aria-label="Execution trail details">
+  <div class="trail-panel">
+    <div class="trail-head">
+      <h3 id="trail-title">Execution trail</h3>
+      <button class="trail-close" id="trail-close" type="button">Close</button>
+    </div>
+    <div class="trail-body" id="trail-body"></div>
+  </div>
+</div>
+
 <script>
 const log        = document.getElementById('log');
 const form       = document.getElementById('form');
@@ -497,6 +759,10 @@ const uPrompt = document.getElementById('u-prompt');
 const uCompletion = document.getElementById('u-completion');
 const uTotal = document.getElementById('u-total');
 const uLatency = document.getElementById('u-latency');
+const trailModal = document.getElementById('trail-modal');
+const trailBody = document.getElementById('trail-body');
+const trailTitle = document.getElementById('trail-title');
+const trailClose = document.getElementById('trail-close');
 
 const STORE_KEY = 'workiq_sessions_v2';
 let personaList = [];
@@ -623,6 +889,7 @@ function newChat(persona) {
     persona: persona || personaSel.value || defaultPersona,
     title: 'New chat',
     html: '',
+    trails: {},
   };
   state.sessions.unshift(s);
   state.activeId = s.id;
@@ -664,6 +931,113 @@ function add(kind, html) {
   return div;
 }
 
+function toPrettyJson(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (err) {
+    return String(value);
+  }
+}
+
+function formatArgs(args) {
+  if (!args || typeof args !== 'object') return escape(String(args || ''));
+  if (Array.isArray(args)) {
+    return args.map(item => escape(String(item))).join('\n');
+  }
+  // Format as plain key: value pairs
+  const pairs = Object.entries(args).map(([k, v]) => {
+    let val;
+    if (typeof v === 'object' && v !== null) {
+      val = JSON.stringify(v);
+    } else {
+      val = String(v);
+    }
+    return escape(k) + ': ' + escape(val);
+  });
+  return pairs.join('\n');
+}
+
+function formatPreviewValue(val) {
+  if (val === null || val === undefined) return '(empty)';
+  if (typeof val === 'string') return val;
+  if (typeof val === 'number' || typeof val === 'boolean') return String(val);
+  if (Array.isArray(val)) {
+    // For arrays of objects, show key: value pairs per item
+    if (val.length === 0) return '(empty array)';
+    if (typeof val[0] === 'object' && val[0] !== null) {
+      return val.map((item, i) => {
+        if (typeof item === 'object') {
+          const pairs = Object.entries(item).map(([k, v]) => k + ': ' + String(v)).join(', ');
+          return pairs;
+        }
+        return String(item);
+      }).join('\n');
+    }
+    return val.join(', ');
+  }
+  if (typeof val === 'object') {
+    // For plain objects, show as key: value pairs
+    const pairs = Object.entries(val).map(([k, v]) => {
+      if (typeof v === 'object') return k + ': ' + JSON.stringify(v);
+      return k + ': ' + String(v);
+    });
+    return pairs.join('\n');
+  }
+  return String(val);
+}
+
+function renderTrailModal(trailEntry) {
+  if (!trailEntry) return;
+  const calls = Array.isArray(trailEntry.tool_calls) ? trailEntry.tool_calls : [];
+  trailTitle.textContent = 'Execution trail #' + trailEntry.turn;
+  const summaryHtml =
+    '<div class="trail-summary">' +
+      '<div class="trail-kpi"><div class="k">Question</div><div class="v" style="word-break:break-word;font-weight:400;margin-top:6px;">' + escape((trailEntry.question || '').substring(0, 60)) + (trailEntry.question && trailEntry.question.length > 60 ? '...' : '') + '</div></div>' +
+      '<div class="trail-kpi"><div class="k">Persona</div><div class="v">' + escape(trailEntry.persona || '') + '</div></div>' +
+      '<div class="trail-kpi"><div class="k">Tool calls</div><div class="v">' + String(calls.length) + '</div></div>' +
+      '<div class="trail-kpi"><div class="k">Turn latency</div><div class="v">' + Number(trailEntry.latency_ms || 0).toFixed(0) + ' ms</div></div>' +
+    '</div>';
+
+  const callsHtml = calls.length
+    ? calls.map(call => {
+        const statusClass = (call.status === 'error' ? 'status-error' : 'status-ok');
+        const argsText = formatArgs(call.args || {});
+        const resultPreviewVal = call.result_preview ? formatPreviewValue(call.result_preview) : '';
+        const callId = call.call_id ? escape(String(call.call_id)) : '—';
+        const errorMsg = call.error ? escape(String(call.error)) : null;
+        return (
+          '<div class="call">' +
+            '<div class="call-head">' +
+              '<div>' +
+                '<div style="color:#9cc7ff;font-weight:700;">' + String(call.index || '?') + '. ' + escape(String(call.tool || 'unknown')) + '</div>' +
+                '<div style="font-size:10px;color:#7f8697;margin-top:2px;">call: ' + callId + '</div>' +
+              '</div>' +
+              '<div style="text-align:right;">' +
+                '<div class="' + statusClass + ' status-badge">' + (call.status === 'error' ? 'Error' : 'Success') + '</div>' +
+                '<div style="font-size:11px;color:#d9e3f8;margin-top:4px;font-variant-numeric:tabular-nums;">' + Number(call.duration_ms || 0).toFixed(2) + ' ms</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="json-section">' +
+              '<div class="json-header" onclick="this.classList.toggle(\'collapsed\');"><span class="json-toggle"></span><span class="json-header-label">Arguments</span></div>' +
+              '<div class="json-body" style="color:#7f8697;white-space:pre-wrap;word-wrap:break-word;">' + argsText + '</div>' +
+            '</div>' +
+            (resultPreviewVal ? '<div class="json-section"><div class="json-header" onclick="this.classList.toggle(\'collapsed\');"><span class="json-toggle"></span><span class="json-header-label">Result preview</span></div><div class="json-body" style="color:#7f8697;white-space:pre-wrap;word-wrap:break-word;">' + resultPreviewVal + '</div></div>' : '') +
+            (errorMsg ? '<div style="margin-top:8px;padding:8px;background:rgba(239,68,68,0.1);border-left:2px solid #ef4444;color:#fca5a5;font-size:11px;"><span style="color:#ef4444;font-weight:600;">Error:</span> ' + errorMsg + '</div>' : '') +
+          '</div>'
+        );
+      }).join('')
+    : '<div class="call" style="text-align:center;padding:20px;color:#7f8697;">No tool calls were made for this turn.</div>';
+
+  trailBody.innerHTML = summaryHtml + callsHtml;
+  trailModal.classList.add('open');
+  trailModal.setAttribute('aria-hidden', 'false');
+}
+
+function hideTrailModal() {
+  trailModal.classList.remove('open');
+  trailModal.setAttribute('aria-hidden', 'true');
+}
+
 // ---- persona dropdown: changing persona starts a NEW chat ----------------- //
 personaSel.addEventListener('change', () => {
   const s = activeSession();
@@ -700,6 +1074,7 @@ document.getElementById('clear-all').addEventListener('click', () => {
     persona: defaultPersona || personaSel.value,
     title: 'New chat',
     html: '',
+    trails: {},
   };
   state.sessions = [s];
   state.activeId = s.id;
@@ -754,6 +1129,7 @@ form.addEventListener('submit', async (e) => {
     }
     const turnUsage = (data && data.usage) || {};
     usageState.turns += 1;
+    const turnNumber = usageState.turns;
     usageState.promptTokens += Number(turnUsage.prompt_tokens || 0);
     usageState.completionTokens += Number(turnUsage.completion_tokens || 0);
     usageState.totalTokens += Number(turnUsage.total_tokens || 0);
@@ -762,6 +1138,26 @@ form.addEventListener('submit', async (e) => {
     let answer = ((data && data.answer) || raw || '(no answer)').replace(/https:\/\/simulator\.local\//g, '/citation/');
     placeholder.innerHTML = marked.parse(answer);
     placeholder.querySelectorAll('a[href^="/citation/"]').forEach(a => a.target = '_blank');
+
+    if (!s.trails) s.trails = {};
+    const trailEntry = {
+      turn: turnNumber,
+      question: text,
+      persona: persona,
+      latency_ms: Number(data && data.latency_ms) || 0,
+      turn_started_at: (data && data.turn_started_at) || null,
+      tool_calls: (data && data.trail) || [],
+    };
+    s.trails[String(turnNumber)] = trailEntry;
+    const toolCallCount = Array.isArray(trailEntry.tool_calls) ? trailEntry.tool_calls.length : 0;
+    const trailNote = document.createElement('div');
+    trailNote.className = 'trail-row';
+    trailNote.innerHTML =
+      '<span>trail</span>' +
+      '<button class="trail-num" type="button" data-turn="' + String(turnNumber) + '">' + String(turnNumber) + '</button>' +
+      '<span class="trail-meta">' + String(toolCallCount) + ' tool call' + (toolCallCount === 1 ? '' : 's') +
+      ' • ' + Number(trailEntry.latency_ms).toFixed(0) + ' ms</span>';
+    placeholder.appendChild(trailNote);
   } catch (err) {
     placeholder.remove();
     add('error', 'error: ' + escape(String(err.message || err)));
@@ -770,6 +1166,24 @@ form.addEventListener('submit', async (e) => {
     send.disabled = false;
     q.focus();
   }
+});
+
+log.addEventListener('click', (e) => {
+  const btn = e.target.closest('.trail-num');
+  if (!btn) return;
+  const s = activeSession();
+  if (!s || !s.trails) return;
+  const turn = btn.getAttribute('data-turn');
+  if (!turn) return;
+  renderTrailModal(s.trails[turn]);
+});
+
+trailClose.addEventListener('click', hideTrailModal);
+trailModal.addEventListener('click', (e) => {
+  if (e.target === trailModal) hideTrailModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') hideTrailModal();
 });
 
 // submit on Enter, newline on Shift+Enter
