@@ -1,0 +1,6 @@
+
+
+docker build -t workiq-web:$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -f deploy/AgentWebUI/Dockerfile .
+
+docker build -t workiq-web:$(Get-Date -Format 'ddMMyyyy')$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -f deploy/A2AAgent/Dockerfile .
+
