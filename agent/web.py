@@ -165,6 +165,13 @@ def _build_login_url(request: Request) -> str:
   return str(request.url_for("auth_login").include_query_params(next=next_path))
 
 
+def _get_redirect_uri(request: Request) -> str:
+  explicit = os.environ.get("WORKIQ_WEB_AUTH_REDIRECT_URI", "").strip()
+  if explicit:
+    return explicit
+  return str(request.url_for("auth_callback"))
+
+
 def _session_user(request: Request) -> dict | None:
   if AUTH_CONFIG is None:
     return None
@@ -388,21 +395,29 @@ async def auth_login(request: Request):
     if AUTH_CONFIG is None:
         return RedirectResponse(url="/", status_code=307)
 
-    state = secrets.token_urlsafe(32)
-    next_path = request.query_params.get("next", "/")
-    if not next_path.startswith("/"):
-        next_path = "/"
+    try:
+        state = secrets.token_urlsafe(32)
+        next_path = request.query_params.get("next", "/")
+        if not next_path.startswith("/"):
+            next_path = "/"
 
-    request.session["auth_state"] = state
-    request.session["post_login_redirect"] = next_path
+        request.session["auth_state"] = state
+        request.session["post_login_redirect"] = next_path
 
-    auth_url = _build_msal_app(AUTH_CONFIG).get_authorization_request_url(
-        scopes=list(AUTH_CONFIG.scopes),
-        state=state,
-        redirect_uri=str(request.url_for("auth_callback")),
-        prompt="select_account",
-    )
-    return RedirectResponse(url=auth_url, status_code=307)
+        auth_url = _build_msal_app(AUTH_CONFIG).get_authorization_request_url(
+            scopes=list(AUTH_CONFIG.scopes),
+            state=state,
+            redirect_uri=_get_redirect_uri(request),
+            prompt="select_account",
+        )
+        return RedirectResponse(url=auth_url, status_code=307)
+    except Exception as exc:
+        logger.exception("Failed to build Microsoft login redirect")
+        return _render_auth_error(
+            "Could not start Microsoft sign-in. "
+            f"Check WORKIQ_WEB_AUTH_* settings. Details: {exc}",
+            status_code=500,
+        )
 
 
 @app.get("/auth/callback", name="auth_callback")
@@ -410,41 +425,48 @@ async def auth_callback(request: Request):
     if AUTH_CONFIG is None:
         return RedirectResponse(url="/", status_code=307)
 
-    error = request.query_params.get("error")
-    if error:
-        description = request.query_params.get("error_description") or error
-        return _render_auth_error(description)
+    try:
+        error = request.query_params.get("error")
+        if error:
+            description = request.query_params.get("error_description") or error
+            return _render_auth_error(description)
 
-    state = request.query_params.get("state")
-    expected_state = request.session.get("auth_state")
-    if not state or state != expected_state:
-        return _render_auth_error("The sign-in response state did not match the original request.")
+        state = request.query_params.get("state")
+        expected_state = request.session.get("auth_state")
+        if not state or state != expected_state:
+            return _render_auth_error("The sign-in response state did not match the original request.")
 
-    code = request.query_params.get("code")
-    if not code:
-        return _render_auth_error("The sign-in response did not include an authorization code.")
+        code = request.query_params.get("code")
+        if not code:
+            return _render_auth_error("The sign-in response did not include an authorization code.")
 
-    result = _build_msal_app(AUTH_CONFIG).acquire_token_by_authorization_code(
-        code=code,
-        scopes=list(AUTH_CONFIG.scopes),
-        redirect_uri=str(request.url_for("auth_callback")),
-    )
-    if "error" in result:
-        description = result.get("error_description") or result["error"]
-        return _render_auth_error(description)
+        result = _build_msal_app(AUTH_CONFIG).acquire_token_by_authorization_code(
+            code=code,
+            scopes=list(AUTH_CONFIG.scopes),
+            redirect_uri=_get_redirect_uri(request),
+        )
+        if "error" in result:
+            description = result.get("error_description") or result["error"]
+            return _render_auth_error(description)
 
-    claims = result.get("id_token_claims") or {}
-    request.session.pop("auth_state", None)
-    request.session["user"] = {
-        "name": claims.get("name") or claims.get("preferred_username") or claims.get("oid") or "unknown",
-        "preferred_username": claims.get("preferred_username"),
-        "oid": claims.get("oid"),
-        "tid": claims.get("tid"),
-    }
-    destination = request.session.pop("post_login_redirect", "/")
-    if not isinstance(destination, str) or not destination.startswith("/"):
-        destination = "/"
-    return RedirectResponse(url=destination, status_code=307)
+        claims = result.get("id_token_claims") or {}
+        request.session.pop("auth_state", None)
+        request.session["user"] = {
+            "name": claims.get("name") or claims.get("preferred_username") or claims.get("oid") or "unknown",
+            "preferred_username": claims.get("preferred_username"),
+            "oid": claims.get("oid"),
+            "tid": claims.get("tid"),
+        }
+        destination = request.session.pop("post_login_redirect", "/")
+        if not isinstance(destination, str) or not destination.startswith("/"):
+            destination = "/"
+        return RedirectResponse(url=destination, status_code=307)
+    except Exception as exc:
+        logger.exception("Microsoft sign-in callback failed")
+        return _render_auth_error(
+            f"Microsoft sign-in callback failed: {exc}",
+            status_code=500,
+        )
 
 
 @app.get("/auth/logout")
