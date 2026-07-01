@@ -24,8 +24,11 @@ Same as workiq_agent.py:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import html
 import logging
 import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -33,9 +36,10 @@ from decimal import Decimal
 from pathlib import Path
 import time
 
+import msal
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 # Make the sibling workiq_agent module importable when running from repo root.
@@ -70,6 +74,136 @@ _scenario = load_scenario(REPO_ROOT / "simulator" / SCENARIO)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class EntraAuthConfig:
+  tenant_id: str
+  client_id: str
+  client_secret: str
+  session_secret: str
+  scopes: tuple[str, ...]
+  secure_cookies: bool
+
+  @property
+  def authority(self) -> str:
+    return f"https://login.microsoftonline.com/{self.tenant_id}"
+
+
+def _load_auth_config() -> EntraAuthConfig | None:
+  if not _env_flag("WORKIQ_WEB_AUTH_ENABLED", default=False):
+    return None
+
+  client_id = os.environ.get("WORKIQ_WEB_AUTH_CLIENT_ID", "").strip()
+  client_secret = os.environ.get("WORKIQ_WEB_AUTH_CLIENT_SECRET", "").strip()
+  tenant_id = os.environ.get("WORKIQ_WEB_AUTH_TENANT_ID", "").strip()
+  session_secret = os.environ.get("WORKIQ_WEB_AUTH_SESSION_SECRET", "").strip()
+  configured = {
+    "WORKIQ_WEB_AUTH_CLIENT_ID": client_id,
+    "WORKIQ_WEB_AUTH_CLIENT_SECRET": client_secret,
+    "WORKIQ_WEB_AUTH_TENANT_ID": tenant_id,
+    "WORKIQ_WEB_AUTH_SESSION_SECRET": session_secret,
+  }
+  present = [name for name, value in configured.items() if value]
+  if not present:
+    return None
+
+  missing = [name for name, value in configured.items() if not value]
+  if missing:
+    raise RuntimeError(
+      "Microsoft Entra web auth is partially configured. Missing: "
+      + ", ".join(missing)
+    )
+  if len(session_secret) < 32:
+    raise RuntimeError(
+      "WORKIQ_WEB_AUTH_SESSION_SECRET must be at least 32 characters long."
+    )
+
+  scopes_raw = os.environ.get(
+    "WORKIQ_WEB_AUTH_SCOPES",
+    "openid profile email",
+  )
+  scopes = tuple(part for part in scopes_raw.split() if part)
+  if not scopes:
+    scopes = ("openid", "profile", "email")
+
+  return EntraAuthConfig(
+    tenant_id=tenant_id,
+    client_id=client_id,
+    client_secret=client_secret,
+    session_secret=session_secret,
+    scopes=scopes,
+    secure_cookies=_env_flag("WORKIQ_WEB_AUTH_SECURE_COOKIES", default=False),
+  )
+
+
+AUTH_CONFIG = _load_auth_config()
+SessionMiddleware = None
+if AUTH_CONFIG is not None:
+  from starlette.middleware.sessions import SessionMiddleware
+
+
+def _build_msal_app(config: EntraAuthConfig) -> msal.ConfidentialClientApplication:
+  return msal.ConfidentialClientApplication(
+    client_id=config.client_id,
+    client_credential=config.client_secret,
+    authority=config.authority,
+  )
+
+
+def _build_login_url(request: Request) -> str:
+  next_path = request.url.path
+  if request.url.query:
+    next_path = f"{next_path}?{request.url.query}"
+  return str(request.url_for("auth_login").include_query_params(next=next_path))
+
+
+def _session_user(request: Request) -> dict | None:
+  if AUTH_CONFIG is None:
+    return None
+  return request.session.get("user")
+
+
+def _require_browser_auth(request: Request) -> RedirectResponse | None:
+  if AUTH_CONFIG is None or _session_user(request):
+    return None
+  return RedirectResponse(_build_login_url(request), status_code=307)
+
+
+def _require_api_auth(request: Request) -> JSONResponse | None:
+  if AUTH_CONFIG is None or _session_user(request):
+    return None
+  return JSONResponse(
+    status_code=401,
+    content={
+      "detail": "Authentication required",
+      "login_url": _build_login_url(request),
+    },
+  )
+
+
+def _render_auth_error(message: str, *, status_code: int = 401) -> HTMLResponse:
+  safe_message = html.escape(message)
+  return HTMLResponse(
+    status_code=status_code,
+    content=(
+      "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+      "<title>Authentication Error</title>"
+      "<style>body{font-family:Segoe UI,system-ui,sans-serif;background:#0f1116;"
+      "color:#e6e6e6;display:grid;place-items:center;min-height:100vh;margin:0;}"
+      ".card{max-width:560px;padding:24px;border:1px solid #2a2d38;border-radius:12px;"
+      "background:#161922;}a{color:#6fb3ff;}</style></head><body>"
+      f"<div class=\"card\"><h1>Authentication failed</h1><p>{safe_message}</p>"
+      "<p><a href=\"/auth/login\">Try signing in again</a></p></div></body></html>"
+    ),
+  )
 
 
 def _truncate_text(value: str, limit: int = 220) -> str:
@@ -214,6 +348,14 @@ async def get_persona_agent(app: FastAPI, persona: str):
 
 
 app = FastAPI(title="Work IQ Orchestrator UI", lifespan=lifespan)
+if AUTH_CONFIG is not None:
+  app.add_middleware(
+    SessionMiddleware,
+    secret_key=AUTH_CONFIG.session_secret,
+    same_site="lax",
+    https_only=AUTH_CONFIG.secure_cookies,
+    max_age=8 * 60 * 60,
+  )
 
 
 class AskRequest(BaseModel):
@@ -223,23 +365,101 @@ class AskRequest(BaseModel):
 
 
 @app.get("/personas")
-async def personas() -> dict:
-    """List selectable personas (id + human label) for the UI dropdown."""
-    return {
-        "default": PERSONA,
-        "personas": [
-            {
-                "id": p["id"],
-                "label": p.get("label", p["id"]),
-                "description": p.get("description", ""),
-            }
-            for p in _scenario.personas
-        ],
+async def personas(request: Request):
+  """List selectable personas (id + human label) for the UI dropdown."""
+  auth = _require_api_auth(request)
+  if auth is not None:
+    return auth
+  return {
+    "default": PERSONA,
+    "personas": [
+      {
+        "id": p["id"],
+        "label": p.get("label", p["id"]),
+        "description": p.get("description", ""),
+      }
+      for p in _scenario.personas
+    ],
+  }
+
+
+@app.get("/auth/login", name="auth_login")
+async def auth_login(request: Request):
+    if AUTH_CONFIG is None:
+        return RedirectResponse(url="/", status_code=307)
+
+    state = secrets.token_urlsafe(32)
+    next_path = request.query_params.get("next", "/")
+    if not next_path.startswith("/"):
+        next_path = "/"
+
+    request.session["auth_state"] = state
+    request.session["post_login_redirect"] = next_path
+
+    auth_url = _build_msal_app(AUTH_CONFIG).get_authorization_request_url(
+        scopes=list(AUTH_CONFIG.scopes),
+        state=state,
+        redirect_uri=str(request.url_for("auth_callback")),
+        prompt="select_account",
+    )
+    return RedirectResponse(url=auth_url, status_code=307)
+
+
+@app.get("/auth/callback", name="auth_callback")
+async def auth_callback(request: Request):
+    if AUTH_CONFIG is None:
+        return RedirectResponse(url="/", status_code=307)
+
+    error = request.query_params.get("error")
+    if error:
+        description = request.query_params.get("error_description") or error
+        return _render_auth_error(description)
+
+    state = request.query_params.get("state")
+    expected_state = request.session.get("auth_state")
+    if not state or state != expected_state:
+        return _render_auth_error("The sign-in response state did not match the original request.")
+
+    code = request.query_params.get("code")
+    if not code:
+        return _render_auth_error("The sign-in response did not include an authorization code.")
+
+    result = _build_msal_app(AUTH_CONFIG).acquire_token_by_authorization_code(
+        code=code,
+        scopes=list(AUTH_CONFIG.scopes),
+        redirect_uri=str(request.url_for("auth_callback")),
+    )
+    if "error" in result:
+        description = result.get("error_description") or result["error"]
+        return _render_auth_error(description)
+
+    claims = result.get("id_token_claims") or {}
+    request.session.pop("auth_state", None)
+    request.session["user"] = {
+        "name": claims.get("name") or claims.get("preferred_username") or claims.get("oid") or "unknown",
+        "preferred_username": claims.get("preferred_username"),
+        "oid": claims.get("oid"),
+        "tid": claims.get("tid"),
     }
+    destination = request.session.pop("post_login_redirect", "/")
+    if not isinstance(destination, str) or not destination.startswith("/"):
+        destination = "/"
+    return RedirectResponse(url=destination, status_code=307)
+
+
+@app.get("/auth/logout")
+async def auth_logout(request: Request):
+    if AUTH_CONFIG is not None:
+        request.session.clear()
+    return RedirectResponse(url="/", status_code=307)
 
 
 @app.post("/ask")
-async def ask(req: AskRequest, request: Request) -> dict:
+async def ask(req: AskRequest, request: Request):
+    auth = _require_api_auth(request)
+    if auth is not None:
+        return auth
+
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="question is required")
@@ -806,6 +1026,10 @@ async function loadPersonas() {
   try {
     const r = await fetch('/personas');
     const data = await r.json();
+    if (r.status === 401 && data && data.login_url) {
+      window.location = data.login_url;
+      return;
+    }
     personaList = data.personas || [];
     defaultPersona = data.default;
   } catch (err) {
@@ -1125,6 +1349,10 @@ form.addEventListener('submit', async (e) => {
     } catch {
       data = null;
     }
+    if (r.status === 401 && data && data.login_url) {
+      window.location = data.login_url;
+      return;
+    }
     if (!r.ok) {
       throw new Error((data && data.detail) || raw || ('HTTP ' + r.status));
     }
@@ -1229,13 +1457,19 @@ window.addEventListener('storage', (e) => {
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> str:
+async def index(request: Request):
+    auth = _require_browser_auth(request)
+    if auth is not None:
+        return auth
     return INDEX_HTML
 
 
 @app.get("/citation/{kind}/{cid}", response_class=HTMLResponse)
-async def citation_detail(kind: str, cid: str) -> str:
+async def citation_detail(kind: str, cid: str, request: Request) -> str:
     """Serve a simple HTML page showing the full citation record."""
+    auth = _require_browser_auth(request)
+    if auth is not None:
+        return auth
     record = _scenario.index.get(cid)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Citation {cid} not found")
@@ -1277,6 +1511,8 @@ def main() -> int:
         port=port,
         reload=False,
         log_level="info",
+    proxy_headers=True,
+    forwarded_allow_ips="*",
     )
     return 0
 
