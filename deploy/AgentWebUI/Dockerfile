@@ -4,15 +4,17 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
-COPY . /app
+COPY deploy/AgentWebUI/requirements.web.txt /tmp/requirements.web.txt
 
-RUN pip install --no-cache-dir --upgrade pip &&
-pip install --no-cache-dir
-fastapi uvicorn
-agent-framework agent-framework-foundry agent-framework-a2a
-azure-identity openai httpx mcp
-azure-monitor-opentelemetry
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /tmp/requirements.web.txt
+
+# Copy only runtime code needed by the web agent to keep context small and
+# preserve cache for dependency layers.
+COPY agent /app/agent
+COPY simulator /app/simulator
 
 EXPOSE 8000
 

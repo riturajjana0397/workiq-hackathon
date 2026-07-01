@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+agent-framework
+agent-framework-foundry
+agent-framework-a2a
+azure-identity
+openai
+httpx
+mcp
+azure-monitor-opentelemetry
