@@ -128,11 +128,12 @@ def _load_auth_config() -> EntraAuthConfig | None:
 
   scopes_raw = os.environ.get(
     "WORKIQ_WEB_AUTH_SCOPES",
-    "openid profile email",
+    "email",
   )
-  scopes = tuple(part for part in scopes_raw.split() if part)
+  reserved_scopes = {"openid", "profile", "offline_access"}
+  scopes = tuple(part for part in scopes_raw.split() if part and part.lower() not in reserved_scopes)
   if not scopes:
-    scopes = ("openid", "profile", "email")
+    scopes = ("email",)
 
   return EntraAuthConfig(
     tenant_id=tenant_id,
