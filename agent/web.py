@@ -40,7 +40,7 @@ import time
 import msal
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 # Make the sibling workiq_agent module importable when running from repo root.
@@ -107,6 +107,7 @@ PWA_SHORT_NAME = "WorkIQ"
 PWA_THEME_COLOR = "#0f1116"
 PWA_BACKGROUND_COLOR = "#0f1116"
 PWA_CACHE_NAME = "workiq-web-v1"
+PWA_ICON_PATH = Path(__file__).resolve().parent / "complog.svg"
 
 
 @dataclass(frozen=True)
@@ -693,8 +694,8 @@ INDEX_HTML = r"""<!doctype html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="WorkIQ">
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="icon" type="image/svg+xml" sizes="any" href="/icon.svg">
-<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="icon" type="image/svg+xml" sizes="any" href="/complog.svg">
+<link rel="apple-touch-icon" href="/complog.svg">
 <script>
   (function () {
     try {
@@ -779,7 +780,31 @@ INDEX_HTML = r"""<!doctype html>
     backdrop-filter: blur(12px);
   }
   #sidebar .brand { padding: 14px 16px; border-bottom: 1px solid var(--border); }
-  #sidebar .brand h2 { margin: 0; font-size: 14px; font-weight: 600; }
+  #sidebar .brand .brand-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  #sidebar .brand .brand-text {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  #sidebar .brand .brand-title {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.2;
+  }
+  #sidebar .brand .brand-logo {
+    width: 50px;
+    height: 50px;
+    flex: 0 0 auto;
+    display: block;
+    border-radius: 50%;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.14);
+  }
   #sidebar .brand .sub { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
   #new-chat {
     margin: 12px 16px; padding: 10px 12px; background: var(--accent); color: var(--text-inverse);
@@ -1157,6 +1182,10 @@ INDEX_HTML = r"""<!doctype html>
       border-bottom: 1px solid var(--border);
       max-height: 44vh;
     }
+    #sidebar .brand .brand-logo {
+      width: 30px;
+      height: 30px;
+    }
     #main {
       height: auto;
       min-height: 56vh;
@@ -1189,8 +1218,13 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <div id="sidebar">
   <div class="brand">
-    <h2>Work IQ Orchestrator</h2>
-    <div class="sub">NorthBridge Health Network</div>
+    <div class="brand-header">
+      <div class="brand-text">
+        <h2 class="brand-title">Work IQ Orchestrator</h2>
+        <div class="sub">NorthBridge Health Network</div>
+      </div>
+      <img class="brand-logo" src="/complog.svg" alt="NorthBridge Health Network logo">
+    </div>
   </div>
   <button id="new-chat" type="button">+ New chat</button>
   <button id="clear-all" type="button">🗑 Clear all</button>
@@ -1914,7 +1948,7 @@ async def manifest() -> JSONResponse:
         "theme_color": PWA_THEME_COLOR,
         "icons": [
           {
-            "src": "/icon.svg",
+            "src": "/complog.svg",
             "sizes": "any",
             "type": "image/svg+xml",
             "purpose": "any maskable",
@@ -1932,7 +1966,7 @@ async def service_worker() -> Response:
 const SHELL_URLS = [
   '/',
   '/manifest.webmanifest',
-  '/icon.svg',
+  '/complog.svg',
   'https://cdn.jsdelivr.net/npm/marked/marked.min.js',
 ];
 
@@ -1985,21 +2019,10 @@ self.addEventListener('fetch', (event) => {{
     )
 
 
-@app.get("/icon.svg")
+@app.get("/complog.svg")
 async def pwa_icon() -> Response:
-    svg = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'>
-  <defs>
-    <linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>
-      <stop offset='0%' stop-color='#1d4ed8'/>
-      <stop offset='100%' stop-color='#2563eb'/>
-    </linearGradient>
-  </defs>
-  <rect width='512' height='512' rx='96' fill='#0f1116'/>
-  <rect x='64' y='64' width='384' height='384' rx='72' fill='url(#g)'/>
-  <path d='M140 188h56l60 160h-54l-10-30h-64l-10 30H64l76-160zm20 90h30l-15-44-15 44zM280 188h50v49h47v-49h51v160h-51v-62h-47v62h-50V188z' fill='#f8fbff'/>
-</svg>"""
-    return Response(
-      content=svg,
+    return FileResponse(
+      path=PWA_ICON_PATH,
       media_type="image/svg+xml",
       headers={"Cache-Control": "public, max-age=86400"},
     )

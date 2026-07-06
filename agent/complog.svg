@@ -1,0 +1,36 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="healthGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0078D4"/>
+      <stop offset="100%" stop-color="#00B294"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Circle Background -->
+  <circle cx="256" cy="256" r="240" fill="url(#healthGrad)"/>
+
+  <!-- Bridge -->
+  <path d="M120 280
+           Q256 160 392 280"
+        fill="none"
+        stroke="white"
+        stroke-width="18"
+        stroke-linecap="round"/>
+
+  <line x1="150" y1="280" x2="150" y2="340" stroke="white" stroke-width="10"/>
+  <line x1="210" y1="225" x2="210" y2="340" stroke="white" stroke-width="10"/>
+  <line x1="302" y1="225" x2="302" y2="340" stroke="white" stroke-width="10"/>
+  <line x1="362" y1="280" x2="362" y2="340" stroke="white" stroke-width="10"/>
+
+  <!-- Healthcare Cross -->
+  <rect x="226" y="120" width="60" height="140" rx="12" fill="white"/>
+  <rect x="186" y="160" width="140" height="60" rx="12" fill="white"/>
+
+  <!-- Network Nodes -->
+  <circle cx="150" cy="360" r="14" fill="white"/>
+  <circle cx="256" cy="390" r="14" fill="white"/>
+  <circle cx="362" cy="360" r="14" fill="white"/>
+
+  <line x1="164" y1="360" x2="242" y2="390" stroke="white" stroke-width="6"/>
+  <line x1="270" y1="390" x2="348" y2="360" stroke="white" stroke-width="6"/>
+</svg>
