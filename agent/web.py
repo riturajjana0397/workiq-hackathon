@@ -1318,19 +1318,23 @@ INDEX_HTML = r"""<!doctype html>
       transform: translateX(-105%);
       transition: transform .28s ease;
       box-shadow: 0 20px 36px rgba(0, 0, 0, 0.28);
+      overflow-y: auto;
+      padding-bottom: calc(8px + env(safe-area-inset-bottom));
     }
     body.sidebar-open #sidebar {
       transform: translateX(0);
     }
     #sessions {
-      max-height: none;
+      flex: 0 0 auto;
+      max-height: 34vh;
     }
     #sidebar .brand .brand-logo {
       width: 30px;
       height: 30px;
     }
     #usage {
-      display: none;
+      display: block;
+      margin: 8px 8px 12px;
     }
     #main {
       height: auto;
