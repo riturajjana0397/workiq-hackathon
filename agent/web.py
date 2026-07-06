@@ -804,6 +804,7 @@ INDEX_HTML = r"""<!doctype html>
     display: grid;
     place-items: center;
     padding: 24px;
+    overflow: hidden;
     background:
       radial-gradient(640px 320px at 78% 18%, rgba(14, 165, 164, 0.26), rgba(14, 165, 164, 0) 62%),
       radial-gradient(680px 360px at 16% 78%, rgba(3, 105, 161, 0.24), rgba(3, 105, 161, 0) 64%),
@@ -818,6 +819,46 @@ INDEX_HTML = r"""<!doctype html>
     visibility: hidden;
     pointer-events: none;
   }
+  .welcome-doors {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    z-index: 6;
+    pointer-events: none;
+  }
+  .door {
+    flex: 1 1 50%;
+    position: relative;
+    background:
+      linear-gradient(180deg, rgba(8, 20, 38, 0.96) 0%, rgba(10, 28, 50, 0.96) 100%),
+      repeating-linear-gradient(90deg, rgba(116, 168, 204, 0.16) 0 2px, rgba(116, 168, 204, 0.02) 2px 14px);
+    box-shadow: inset 0 0 0 1px rgba(182, 220, 247, 0.16), inset 0 0 80px rgba(0, 0, 0, 0.36);
+  }
+  .door::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    width: 10px;
+    height: 10px;
+    margin-top: -5px;
+    border-radius: 50%;
+    background: rgba(238, 246, 255, 0.76);
+    box-shadow: 0 0 0 2px rgba(15, 23, 42, 0.34);
+  }
+  .door-left {
+    border-right: 1px solid rgba(182, 220, 247, 0.2);
+    animation: door-left-cycle 3s cubic-bezier(.64, .03, .31, .97) forwards;
+  }
+  .door-left::after {
+    right: 16px;
+  }
+  .door-right {
+    border-left: 1px solid rgba(182, 220, 247, 0.2);
+    animation: door-right-cycle 3s cubic-bezier(.64, .03, .31, .97) forwards;
+  }
+  .door-right::after {
+    left: 16px;
+  }
   .welcome-panel {
     width: min(620px, 100%);
     text-align: center;
@@ -827,6 +868,8 @@ INDEX_HTML = r"""<!doctype html>
     background: rgba(8, 24, 46, 0.48);
     backdrop-filter: blur(8px);
     box-shadow: 0 24px 48px rgba(0, 0, 0, 0.34);
+    position: relative;
+    z-index: 2;
   }
   .welcome-logo {
     width: 96px;
@@ -884,14 +927,28 @@ INDEX_HTML = r"""<!doctype html>
     from { width: 0; }
     to { width: 100%; }
   }
+  @keyframes door-left-cycle {
+    0%, 16% { transform: translateX(0); }
+    40%, 72% { transform: translateX(-102%); }
+    100% { transform: translateX(0); }
+  }
+  @keyframes door-right-cycle {
+    0%, 16% { transform: translateX(0); }
+    40%, 72% { transform: translateX(102%); }
+    100% { transform: translateX(0); }
+  }
 
   @media (prefers-reduced-motion: reduce) {
+    .door-left,
+    .door-right,
     .welcome-logo,
     .welcome-title,
     .welcome-sub,
     .welcome-progress {
       animation: none;
     }
+    .door-left { transform: translateX(-102%); }
+    .door-right { transform: translateX(102%); }
   }
 
   /* Sidebar */
@@ -1374,6 +1431,10 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
 <div id="welcome-splash" aria-live="polite" role="status">
+  <div class="welcome-doors" aria-hidden="true">
+    <div class="door door-left"></div>
+    <div class="door door-right"></div>
+  </div>
   <div class="welcome-panel">
     <img class="welcome-logo" src="/complog.svg" alt="Work IQ logo">
     <h1 class="welcome-title">Welcome to Northbridge</h1>
