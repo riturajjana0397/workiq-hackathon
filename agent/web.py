@@ -772,6 +772,103 @@ INDEX_HTML = r"""<!doctype html>
     transition: background-color .3s ease, color .3s ease;
   }
 
+  #welcome-splash {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background:
+      radial-gradient(640px 320px at 78% 18%, rgba(14, 165, 164, 0.26), rgba(14, 165, 164, 0) 62%),
+      radial-gradient(680px 360px at 16% 78%, rgba(3, 105, 161, 0.24), rgba(3, 105, 161, 0) 64%),
+      linear-gradient(145deg, #071529 0%, #0e2744 42%, #12345a 100%);
+    color: #f8fbff;
+    transition: opacity .7s ease, visibility .7s ease;
+  }
+  #welcome-splash.is-exiting {
+    opacity: 0;
+  }
+  #welcome-splash.is-hidden {
+    visibility: hidden;
+    pointer-events: none;
+  }
+  .welcome-panel {
+    width: min(620px, 100%);
+    text-align: center;
+    padding: 28px 24px;
+    border-radius: 18px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(8, 24, 46, 0.48);
+    backdrop-filter: blur(8px);
+    box-shadow: 0 24px 48px rgba(0, 0, 0, 0.34);
+  }
+  .welcome-logo {
+    width: 96px;
+    height: 96px;
+    border-radius: 24px;
+    display: block;
+    margin: 0 auto;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.32);
+    animation: welcome-float 2.6s ease-in-out infinite;
+  }
+  .welcome-title {
+    margin: 16px 0 6px;
+    font-size: clamp(28px, 4vw, 40px);
+    letter-spacing: .01em;
+    font-weight: 700;
+    animation: welcome-rise .9s ease both;
+  }
+  .welcome-sub {
+    margin: 0;
+    color: rgba(248, 251, 255, 0.84);
+    font-size: clamp(14px, 2.1vw, 18px);
+    animation: welcome-rise 1.15s ease both;
+  }
+  .welcome-bar {
+    margin: 20px auto 0;
+    width: min(320px, 100%);
+    height: 4px;
+    border-radius: 999px;
+    background: rgba(248, 251, 255, 0.22);
+    overflow: hidden;
+  }
+  .welcome-progress {
+    height: 100%;
+    width: 0;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #22d3ee 0%, #34d399 100%);
+    animation: welcome-progress 3s linear forwards;
+  }
+
+  @keyframes welcome-float {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-8px); }
+  }
+  @keyframes welcome-rise {
+    from {
+      transform: translateY(10px);
+      opacity: 0;
+    }
+    to {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  }
+  @keyframes welcome-progress {
+    from { width: 0; }
+    to { width: 100%; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .welcome-logo,
+    .welcome-title,
+    .welcome-sub,
+    .welcome-progress {
+      animation: none;
+    }
+  }
+
   /* Sidebar */
   #sidebar {
     width: 270px; min-width: 270px; background: var(--bg-sidebar);
@@ -1216,6 +1313,17 @@ INDEX_HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
+<div id="welcome-splash" aria-live="polite" role="status">
+  <div class="welcome-panel">
+    <img class="welcome-logo" src="/complog.svg" alt="Work IQ logo">
+    <h1 class="welcome-title">Welcome to Northbridge</h1>
+    <p class="welcome-sub">Preparing your workspace...</p>
+    <div class="welcome-bar" aria-hidden="true">
+      <div class="welcome-progress"></div>
+    </div>
+  </div>
+</div>
+
 <div id="sidebar">
   <div class="brand">
     <div class="brand-header">
@@ -1330,7 +1438,19 @@ const trailTitle = document.getElementById('trail-title');
 const trailClose = document.getElementById('trail-close');
 const themeToggle = document.getElementById('theme-toggle');
 const themeColorMeta = document.querySelector('meta[name="theme-color"]');
+const welcomeSplash = document.getElementById('welcome-splash');
 const THEME_STORE_KEY = 'workiq_theme_v1';
+
+function startWelcomeSplash() {
+  if (!welcomeSplash) return;
+  window.setTimeout(() => {
+    welcomeSplash.classList.add('is-exiting');
+    window.setTimeout(() => {
+      welcomeSplash.classList.add('is-hidden');
+      welcomeSplash.setAttribute('aria-hidden', 'true');
+    }, 700);
+  }, 3000);
+}
 
 function themeColorFor(theme) {
   return theme === 'ops' ? '#0b1220' : '#f4f7fb';
@@ -1869,6 +1989,8 @@ q.addEventListener('keydown', (e) => {
 
 // ---- boot ----------------------------------------------------------------- //
 (async function init() {
+  startWelcomeSplash();
+
   let savedTheme = 'clinical';
   try {
     savedTheme = localStorage.getItem(THEME_STORE_KEY) || document.documentElement.getAttribute('data-theme') || 'clinical';
