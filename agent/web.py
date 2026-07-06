@@ -9,7 +9,7 @@ Run
 ---
   .\.venv\Scripts\python.exe -m pip install fastapi uvicorn
   # in another terminal: start the A2A side of the simulator
-  .\.venv\Scripts\python.exe simulator\a2a_server.py
+  .\.venv\Scripts\python.exe simu2lator\a2a_server.py
   # then start the web app
   .\.venv\Scripts\python.exe agent\web.py
   # open http://127.0.0.1:8000
@@ -39,24 +39,18 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from workiq_agent import (  # noqa: E402
-    Agent,
-    INSTRUCTIONS,
     PERSONA,
     SCENARIO,
     DEPLOYMENT,
-    A2A_CARD_URL,
-    MCP_SCRIPT,
-    REPO_ROOT,
-    build_a2a_agent,
-    build_chat_client,
-    build_mcp_tool,
+    orchestrate,
 )
+import httpx  # noqa: E402
 from telemetry import (
-    record_usage,
     setup_telemetry,
     span_context_attributes,
 )  # noqa: E402
-from agent_framework import AgentSession  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Load scenario data for citation lookup
 sys.path.insert(0, str(REPO_ROOT / "simulator"))
@@ -77,93 +71,25 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     telemetry = setup_telemetry("workiq-web")
     app.state._telemetry = telemetry
-    # One chat client shared by every persona's agent.
-    app.state.chat_client = build_chat_client()
-    # persona id -> {"agent", "mcp", "a2a"} built lazily on first use.
-    app.state.agents = {}
-    app.state.build_lock = asyncio.Lock()
-    # session_key -> AgentSession for conversation memory
-    app.state.sessions = {}
-
-    # Warm up the default persona so the first request is fast.
-    await get_persona_agent(app, PERSONA)
-
-    # Pre-warm the remaining personas in the background so switching personas
-    # never stalls a request on a cold start (each spawns its own MCP child).
-    async def _prewarm():
-        for p in _scenario.personas:
-            pid = p["id"]
-            if pid in app.state.agents:
-                continue
-            try:
-                await get_persona_agent(app, pid)
-            except Exception as exc:  # don't let one persona break the rest
-                print(f"[workiq-web] prewarm failed for '{pid}': {exc}", file=sys.stderr)
-    app.state._prewarm_task = asyncio.create_task(_prewarm())
+    # One shared HTTP client for all A2A calls to the three sub-agents.
+    app.state.http = httpx.AsyncClient(timeout=180.0)
+    # session_key -> stable context_id so each chat has its own thread on the sub-agents.
+    app.state.contexts = {}
 
     print(
-        "[workiq-web] agent ready\n"
+        "[workiq-web] orchestrator ready\n"
         f"  Foundry deployment : {DEPLOYMENT}\n"
         f"  Scenario           : {SCENARIO}\n"
         f"  Default persona    : {PERSONA}\n"
         f"  Personas available : {', '.join(p['id'] for p in _scenario.personas)}\n"
-        f"  MCP child          : {MCP_SCRIPT.name}\n"
-        f"  A2A card           : {A2A_CARD_URL}\n"
+        "  Sub-agents         : intent :8930 | planner :8931 | citation :8932\n"
         "  Open               : http://127.0.0.1:8000",
         file=sys.stderr,
     )
     try:
         yield
     finally:
-        for entry in app.state.agents.values():
-            try:
-                await entry["a2a"].__aexit__(None, None, None)
-            except Exception:
-                pass
-            try:
-                await entry["mcp"].__aexit__(None, None, None)
-            except Exception:
-                pass
-
-
-async def get_persona_agent(app: FastAPI, persona: str):
-    """Return (building if needed) the cached agent stack for a persona.
-
-    Each persona gets its own MCP child process and A2A session so the
-    simulator applies that persona's RBAC. Stacks are cached for reuse.
-    """
-    valid = {p["id"] for p in _scenario.personas}
-    if persona not in valid:
-        persona = PERSONA
-
-    cached = app.state.agents.get(persona)
-    if cached:
-        return cached["agent"]
-
-    async with app.state.build_lock:
-        # Re-check inside the lock in case another request built it.
-        cached = app.state.agents.get(persona)
-        if cached:
-            return cached["agent"]
-
-        mcp_tool = build_mcp_tool(persona)
-        a2a_agent = build_a2a_agent(persona)
-        await mcp_tool.__aenter__()
-        await a2a_agent.__aenter__()
-
-        agent = Agent(
-            client=app.state.chat_client,
-            name="workiq-orchestrator",
-            instructions=INSTRUCTIONS,
-            tools=[mcp_tool, a2a_agent.as_tool()],
-        )
-        app.state.agents[persona] = {
-            "agent": agent,
-            "mcp": mcp_tool,
-            "a2a": a2a_agent,
-        }
-        print(f"[workiq-web] built agent for persona '{persona}'", file=sys.stderr)
-        return agent
+        await app.state.http.aclose()
 
 
 app = FastAPI(title="Work IQ Orchestrator UI", lifespan=lifespan)
@@ -199,14 +125,18 @@ async def ask(req: AskRequest, request: Request) -> dict:
 
     telemetry = request.app.state._telemetry
     persona = (req.persona or PERSONA).strip()
-    agent = await get_persona_agent(request.app, persona)
+    valid = {p["id"] for p in _scenario.personas}
+    if persona not in valid:
+        persona = PERSONA
 
-    # Get or create a session for conversation memory.
+    # Stable context_id per (persona, session) so sub-agents can maintain thread state.
     session_id = req.session_id or "default"
     session_key = f"{persona}:{session_id}"
-    if session_key not in request.app.state.sessions:
-        request.app.state.sessions[session_key] = AgentSession(session_id=session_key)
-    session = request.app.state.sessions[session_key]
+    contexts = request.app.state.contexts
+    if session_key not in contexts:
+        import uuid as _uuid
+        contexts[session_key] = f"ctx-{_uuid.uuid4().hex[:12]}"
+    context_id = contexts[session_key]
 
     started = time.perf_counter()
     elapsed_ms = 0.0
@@ -224,15 +154,27 @@ async def ask(req: AskRequest, request: Request) -> dict:
                 question_chars=len(q),
             ),
         ) as span:
-            response = await agent.run(q, session=session)
-            usage = record_usage(telemetry, response, span)
-            answer_text = (
-                getattr(response, "text", None)
-                or getattr(response, "content", None)
-                or str(response)
+            result = await orchestrate(
+                request.app.state.http,
+                q,
+                telemetry,
+                persona=persona,
+                context_id=context_id,
             )
-            if usage:
-                span.set_attribute("workiq.total_tokens", usage.get("total_tokens", 0))
+            if isinstance(result, dict):
+                answer_text = result.get("answer", "") or ""
+                usage = result.get("usage", {}) or {}
+            else:
+                # Backwards compat: old orchestrate() returned a plain string.
+                answer_text = str(result)
+                usage = {}
+            span.set_attribute("workiq.answer_chars", len(answer_text or ""))
+            if usage.get("total_tokens"):
+                span.set_attribute("ai.total_tokens", usage["total_tokens"])
+            if usage.get("prompt_tokens"):
+                span.set_attribute("ai.prompt_tokens", usage["prompt_tokens"])
+            if usage.get("completion_tokens"):
+                span.set_attribute("ai.completion_tokens", usage["completion_tokens"])
     except HTTPException:
         raise
     except Exception as exc:
@@ -464,6 +406,9 @@ INDEX_HTML = r"""<!doctype html>
   <div class="row"><span class="label">Prompt tokens <span class="info" title="Tokens in your question and conversation context sent to the model.">i</span></span><span class="value" id="u-prompt">0</span></div>
   <div class="row"><span class="label">Completion tokens <span class="info" title="Tokens generated by the model in its answer.">i</span></span><span class="value" id="u-completion">0</span></div>
   <div class="row"><span class="label">Total tokens <span class="info" title="Prompt tokens + completion tokens for the turn.">i</span></span><span class="value" id="u-total">0</span></div>
+  <div class="row"><span class="label">Intent tokens <span class="info" title="Total tokens consumed by the Intent Detection sub-agent.">i</span></span><span class="value" id="u-intent">0</span></div>
+  <div class="row"><span class="label">Planner tokens <span class="info" title="Total tokens consumed by the Tool Planner sub-agent.">i</span></span><span class="value" id="u-planner">0</span></div>
+  <div class="row"><span class="label">Citation tokens <span class="info" title="Total tokens consumed by the Citation Builder sub-agent.">i</span></span><span class="value" id="u-citation">0</span></div>
   <div class="row"><span class="label">Last latency <span class="info" title="How long the most recent request took end to end.">i</span></span><span class="value" id="u-latency">0 ms</span></div>
   <div class="hint">Use this as a proxy for model credits consumed.</div>
 </aside>
@@ -491,11 +436,17 @@ const usageState = {
   promptTokens: 0,
   completionTokens: 0,
   totalTokens: 0,
+  intentTokens: 0,
+  plannerTokens: 0,
+  citationTokens: 0,
 };
 const uTurns = document.getElementById('u-turns');
 const uPrompt = document.getElementById('u-prompt');
 const uCompletion = document.getElementById('u-completion');
 const uTotal = document.getElementById('u-total');
+const uIntent = document.getElementById('u-intent');
+const uPlanner = document.getElementById('u-planner');
+const uCitation = document.getElementById('u-citation');
 const uLatency = document.getElementById('u-latency');
 
 const STORE_KEY = 'workiq_sessions_v2';
@@ -685,6 +636,9 @@ function refreshUsage(latencyMs) {
   uPrompt.textContent = String(usageState.promptTokens);
   uCompletion.textContent = String(usageState.completionTokens);
   uTotal.textContent = String(usageState.totalTokens);
+  uIntent.textContent = String(usageState.intentTokens);
+  uPlanner.textContent = String(usageState.plannerTokens);
+  uCitation.textContent = String(usageState.citationTokens);
   uLatency.textContent = Number.isFinite(latencyMs) ? `${latencyMs.toFixed(0)} ms` : '0 ms';
 }
 newChatBtn.addEventListener('click', () => newChat(personaSel.value || defaultPersona));
@@ -757,6 +711,10 @@ form.addEventListener('submit', async (e) => {
     usageState.promptTokens += Number(turnUsage.prompt_tokens || 0);
     usageState.completionTokens += Number(turnUsage.completion_tokens || 0);
     usageState.totalTokens += Number(turnUsage.total_tokens || 0);
+    const bySub = (turnUsage && turnUsage.by_subagent) || {};
+    usageState.intentTokens   += Number((bySub.intent   || {}).total_tokens || 0);
+    usageState.plannerTokens  += Number((bySub.planner  || {}).total_tokens || 0);
+    usageState.citationTokens += Number((bySub.citation || {}).total_tokens || 0);
     refreshUsage(Number(data && data.latency_ms));
     placeholder.classList.remove('thinking');
     let answer = ((data && data.answer) || raw || '(no answer)').replace(/https:\/\/simulator\.local\//g, '/citation/');
