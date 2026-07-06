@@ -115,6 +115,13 @@ Routing rules:
   - For data operations (read or write to tables), use workiq-mcp tools.
   - For compound tasks ("summarise the blockers AND open a risk item for each"),
     chain: ask via workiq-a2a, then call workiq-mcp.create_entity per blocker.
+    - For requests that ask you to "fetch every capa_tracker row, summarize the top 3 risks and create an action item for each",
+        you MUST execute the full chain in order:
+            1) call fetch("capa_tracker") to retrieve all rows,
+            2) analyze the rows and identify the top 3 risks,
+            3) create one action item for each of those 3 risks with workiq-mcp.create_entity,
+            4) report the 3 risks and the created action-item ids/fields.
+        Do not stop after summarizing; do not stop after fetching; do not stop after creating fewer than 3 action items.
 
 Action execution rules:
   - When the user asks you to update, flag, escalate, or modify records, you MUST

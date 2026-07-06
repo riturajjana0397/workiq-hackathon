@@ -40,7 +40,7 @@ import time
 import msal
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 # Make the sibling workiq_agent module importable when running from repo root.
@@ -101,6 +101,12 @@ COOLDOWN_SECONDS = _env_int("WORKIQ_WEB_COOLDOWN_SECONDS", default=0)
 UI_ENABLE_CLIENT_COOLDOWN = _env_flag("WORKIQ_WEB_UI_ENABLE_CLIENT_COOLDOWN", default=True)
 UI_SHOW_COOLDOWN_TIMER = _env_flag("WORKIQ_WEB_UI_SHOW_COOLDOWN_TIMER", default=True)
 UI_SHOW_TOKEN_REMAINING = _env_flag("WORKIQ_WEB_UI_SHOW_TOKEN_REMAINING", default=True)
+
+PWA_APP_NAME = "Work IQ Orchestrator"
+PWA_SHORT_NAME = "WorkIQ"
+PWA_THEME_COLOR = "#0f1116"
+PWA_BACKGROUND_COLOR = "#0f1116"
+PWA_CACHE_NAME = "workiq-web-v1"
 
 
 @dataclass(frozen=True)
@@ -682,6 +688,13 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <title>Work IQ — Orchestrator</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f1116">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="WorkIQ">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/svg+xml" sizes="any" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
 <!-- markdown rendering for the agent's reply -->
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
@@ -1087,6 +1100,14 @@ const trailModal = document.getElementById('trail-modal');
 const trailBody = document.getElementById('trail-body');
 const trailTitle = document.getElementById('trail-title');
 const trailClose = document.getElementById('trail-close');
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch((err) => {
+      console.warn('service worker registration failed', err);
+    });
+  });
+}
 
 const STORE_KEY = 'workiq_sessions_v2';
 let personaList = [];
@@ -1647,6 +1668,112 @@ async def index(request: Request):
       },
     }
     return INDEX_HTML.replace('"__WORKIQ_SERVER_CONFIG__"', json.dumps(server_config))
+
+
+@app.get("/manifest.webmanifest")
+async def manifest() -> JSONResponse:
+    return JSONResponse(
+      {
+        "name": PWA_APP_NAME,
+        "short_name": PWA_SHORT_NAME,
+        "description": "Work IQ orchestrator chat UI for mobile and desktop.",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": PWA_BACKGROUND_COLOR,
+        "theme_color": PWA_THEME_COLOR,
+        "icons": [
+          {
+            "src": "/icon.svg",
+            "sizes": "any",
+            "type": "image/svg+xml",
+            "purpose": "any maskable",
+          }
+        ],
+      },
+      media_type="application/manifest+json",
+      headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/sw.js")
+async def service_worker() -> Response:
+    script = f"""const CACHE_NAME = '{PWA_CACHE_NAME}';
+const SHELL_URLS = [
+  '/',
+  '/manifest.webmanifest',
+  '/icon.svg',
+  'https://cdn.jsdelivr.net/npm/marked/marked.min.js',
+];
+
+self.addEventListener('install', (event) => {{
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL_URLS))
+  );
+  self.skipWaiting();
+}});
+
+self.addEventListener('activate', (event) => {{
+  event.waitUntil(
+    caches.keys().then((keys) => Promise.all(
+      keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))
+    ))
+  );
+  self.clients.claim();
+}});
+
+self.addEventListener('fetch', (event) => {{
+  if (event.request.method !== 'GET') return;
+
+  const url = new URL(event.request.url);
+  const isSameOrigin = url.origin === self.location.origin;
+
+  if (!isSameOrigin) {{
+    event.respondWith(
+      caches.match(event.request).then((cached) => cached || fetch(event.request))
+    );
+    return;
+  }}
+
+  if (url.pathname.startsWith('/ask')) return;
+
+  event.respondWith(
+    fetch(event.request)
+      .then((response) => {{
+        const copy = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+        return response;
+      }})
+      .catch(() => caches.match(event.request))
+  );
+}});
+"""
+    return Response(
+      content=script,
+      media_type="application/javascript",
+      headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/icon.svg")
+async def pwa_icon() -> Response:
+    svg = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'>
+  <defs>
+    <linearGradient id='g' x1='0' y1='0' x2='1' y2='1'>
+      <stop offset='0%' stop-color='#1d4ed8'/>
+      <stop offset='100%' stop-color='#2563eb'/>
+    </linearGradient>
+  </defs>
+  <rect width='512' height='512' rx='96' fill='#0f1116'/>
+  <rect x='64' y='64' width='384' height='384' rx='72' fill='url(#g)'/>
+  <path d='M140 188h56l60 160h-54l-10-30h-64l-10 30H64l76-160zm20 90h30l-15-44-15 44zM280 188h50v49h47v-49h51v160h-51v-62h-47v62h-50V188z' fill='#f8fbff'/>
+</svg>"""
+    return Response(
+      content=svg,
+      media_type="image/svg+xml",
+      headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/citation/{kind}/{cid}", response_class=HTMLResponse)
