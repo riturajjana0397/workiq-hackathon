@@ -688,7 +688,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Work IQ — Orchestrator</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0f1116">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -770,6 +770,31 @@ INDEX_HTML = r"""<!doctype html>
     color: var(--text-main);
     display: flex; flex-direction: row; height: 100vh; overflow: hidden;
     transition: background-color .3s ease, color .3s ease;
+  }
+
+  #mobile-topbar {
+    display: none;
+  }
+  #mobile-menu-btn {
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-main);
+    border-radius: 8px;
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  #mobile-title {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: .02em;
+    color: var(--text-main);
+  }
+  #mobile-backdrop {
+    display: none;
   }
 
   #welcome-splash {
@@ -1249,43 +1274,68 @@ INDEX_HTML = r"""<!doctype html>
   }
 
   @media (max-width: 980px) {
-    #sidebar {
-      width: 236px;
-      min-width: 236px;
-    }
-    .persona-box {
-      align-items: flex-start;
-    }
-    #persona,
-    #theme-toggle-wrap,
-    #persona-desc {
-      max-width: 240px;
-      text-align: left;
-    }
-  }
-
-  @media (max-width: 760px) {
     body {
       flex-direction: column;
-      height: auto;
-      min-height: 100vh;
-      overflow: auto;
+      height: 100dvh;
+      min-height: 100dvh;
+      overflow: hidden;
+    }
+    #mobile-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      height: 56px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-header);
+      backdrop-filter: blur(10px);
+      position: sticky;
+      top: 0;
+      z-index: 90;
+    }
+    #mobile-backdrop {
+      position: fixed;
+      inset: 56px 0 0 0;
+      background: var(--overlay);
+      z-index: 79;
+    }
+    body.sidebar-open #mobile-backdrop {
+      display: block;
     }
     #sidebar {
-      width: 100%;
-      min-width: 100%;
+      position: fixed;
+      top: 56px;
+      left: 0;
+      bottom: 0;
+      width: min(88vw, 320px);
+      min-width: 0;
+      max-height: none;
       height: auto;
-      border-right: 0;
-      border-bottom: 1px solid var(--border);
-      max-height: 44vh;
+      border-right: 1px solid var(--border);
+      border-bottom: 0;
+      z-index: 80;
+      transform: translateX(-105%);
+      transition: transform .28s ease;
+      box-shadow: 0 20px 36px rgba(0, 0, 0, 0.28);
+    }
+    body.sidebar-open #sidebar {
+      transform: translateX(0);
+    }
+    #sessions {
+      max-height: none;
     }
     #sidebar .brand .brand-logo {
       width: 30px;
       height: 30px;
     }
+    #usage {
+      display: none;
+    }
     #main {
       height: auto;
-      min-height: 56vh;
+      min-height: 0;
+      flex: 1;
     }
     header {
       flex-direction: column;
@@ -1308,6 +1358,12 @@ INDEX_HTML = r"""<!doctype html>
     }
     form {
       padding: 12px;
+      position: sticky;
+      bottom: 0;
+      z-index: 20;
+    }
+    textarea {
+      min-height: 52px;
     }
   }
 </style>
@@ -1323,6 +1379,14 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 </div>
+
+<div id="mobile-topbar">
+  <button id="mobile-menu-btn" type="button" aria-label="Open chats menu" aria-expanded="false">☰</button>
+  <div id="mobile-title">Work IQ Orchestrator</div>
+  <div style="width:40px;height:40px;"></div>
+</div>
+
+<div id="mobile-backdrop" aria-hidden="true"></div>
 
 <div id="sidebar">
   <div class="brand">
@@ -1439,7 +1503,33 @@ const trailClose = document.getElementById('trail-close');
 const themeToggle = document.getElementById('theme-toggle');
 const themeColorMeta = document.querySelector('meta[name="theme-color"]');
 const welcomeSplash = document.getElementById('welcome-splash');
+const mobileMenuBtn = document.getElementById('mobile-menu-btn');
+const mobileBackdrop = document.getElementById('mobile-backdrop');
+const main = document.getElementById('main');
 const THEME_STORE_KEY = 'workiq_theme_v1';
+
+function isMobileLayout() {
+  return window.matchMedia('(max-width: 980px)').matches;
+}
+
+function setSidebarOpen(open) {
+  if (!isMobileLayout()) {
+    document.body.classList.remove('sidebar-open');
+    if (mobileMenuBtn) mobileMenuBtn.setAttribute('aria-expanded', 'false');
+    return;
+  }
+  document.body.classList.toggle('sidebar-open', Boolean(open));
+  if (mobileMenuBtn) mobileMenuBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function closeSidebar() {
+  setSidebarOpen(false);
+}
+
+function toggleSidebar() {
+  const isOpen = document.body.classList.contains('sidebar-open');
+  setSidebarOpen(!isOpen);
+}
 
 function startWelcomeSplash() {
   if (!welcomeSplash) return;
@@ -1604,6 +1694,7 @@ function switchTo(id) {
   saveState();
   renderSidebar();
   renderActive();
+  closeSidebar();
   q.focus();
 }
 
@@ -1832,6 +1923,21 @@ function setCooldown(seconds) {
 }
 newChatBtn.addEventListener('click', () => newChat(personaSel.value || defaultPersona));
 
+if (mobileMenuBtn) {
+  mobileMenuBtn.addEventListener('click', toggleSidebar);
+}
+if (mobileBackdrop) {
+  mobileBackdrop.addEventListener('click', closeSidebar);
+}
+if (main) {
+  main.addEventListener('click', () => {
+    if (isMobileLayout()) closeSidebar();
+  });
+}
+window.addEventListener('resize', () => {
+  if (!isMobileLayout()) closeSidebar();
+});
+
 document.getElementById('clear-all').addEventListener('click', () => {
   if (!confirm('Delete all chats?')) return;
   state.sessions = [];
@@ -1976,7 +2082,10 @@ trailModal.addEventListener('click', (e) => {
   if (e.target === trailModal) hideTrailModal();
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') hideTrailModal();
+  if (e.key === 'Escape') {
+    hideTrailModal();
+    closeSidebar();
+  }
 });
 
 // submit on Enter, newline on Shift+Enter
@@ -1990,6 +2099,7 @@ q.addEventListener('keydown', (e) => {
 // ---- boot ----------------------------------------------------------------- //
 (async function init() {
   startWelcomeSplash();
+  closeSidebar();
 
   let savedTheme = 'clinical';
   try {
