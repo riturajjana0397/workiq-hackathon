@@ -24,7 +24,12 @@ Same as workiq_agent.py:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import html
+import json
 import logging
+import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -32,9 +37,10 @@ from decimal import Decimal
 from pathlib import Path
 import time
 
+import msal
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 # Make the sibling workiq_agent module importable when running from repo root.
@@ -69,6 +75,163 @@ _scenario = load_scenario(REPO_ROOT / "simulator" / SCENARIO)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int = 0) -> int:
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  try:
+    parsed = int(value.strip())
+  except (TypeError, ValueError):
+    logger.warning("Invalid %s=%r; using default %d", name, value, default)
+    return default
+  return parsed if parsed >= 0 else 0
+
+
+TOKEN_LIMIT_PER_SESSION = _env_int("WORKIQ_WEB_TOKEN_LIMIT", default=0)
+COOLDOWN_SECONDS = _env_int("WORKIQ_WEB_COOLDOWN_SECONDS", default=0)
+UI_ENABLE_CLIENT_COOLDOWN = _env_flag("WORKIQ_WEB_UI_ENABLE_CLIENT_COOLDOWN", default=True)
+UI_SHOW_COOLDOWN_TIMER = _env_flag("WORKIQ_WEB_UI_SHOW_COOLDOWN_TIMER", default=True)
+UI_SHOW_TOKEN_REMAINING = _env_flag("WORKIQ_WEB_UI_SHOW_TOKEN_REMAINING", default=True)
+
+
+@dataclass(frozen=True)
+class EntraAuthConfig:
+  tenant_id: str
+  client_id: str
+  client_secret: str
+  session_secret: str
+  scopes: tuple[str, ...]
+  secure_cookies: bool
+
+  @property
+  def authority(self) -> str:
+    return f"https://login.microsoftonline.com/{self.tenant_id}"
+
+
+def _load_auth_config() -> EntraAuthConfig | None:
+  if not _env_flag("WORKIQ_WEB_AUTH_ENABLED", default=False):
+    return None
+
+  client_id = os.environ.get("WORKIQ_WEB_AUTH_CLIENT_ID", "").strip()
+  client_secret = os.environ.get("WORKIQ_WEB_AUTH_CLIENT_SECRET", "").strip()
+  tenant_id = os.environ.get("WORKIQ_WEB_AUTH_TENANT_ID", "").strip()
+  session_secret = os.environ.get("WORKIQ_WEB_AUTH_SESSION_SECRET", "").strip()
+  configured = {
+    "WORKIQ_WEB_AUTH_CLIENT_ID": client_id,
+    "WORKIQ_WEB_AUTH_CLIENT_SECRET": client_secret,
+    "WORKIQ_WEB_AUTH_TENANT_ID": tenant_id,
+    "WORKIQ_WEB_AUTH_SESSION_SECRET": session_secret,
+  }
+  present = [name for name, value in configured.items() if value]
+  if not present:
+    return None
+
+  missing = [name for name, value in configured.items() if not value]
+  if missing:
+    raise RuntimeError(
+      "Microsoft Entra web auth is partially configured. Missing: "
+      + ", ".join(missing)
+    )
+  if len(session_secret) < 32:
+    raise RuntimeError(
+      "WORKIQ_WEB_AUTH_SESSION_SECRET must be at least 32 characters long."
+    )
+
+  scopes_raw = os.environ.get(
+    "WORKIQ_WEB_AUTH_SCOPES",
+    "email",
+  )
+  reserved_scopes = {"openid", "profile", "offline_access"}
+  scopes = tuple(part for part in scopes_raw.split() if part and part.lower() not in reserved_scopes)
+  if not scopes:
+    scopes = ("email",)
+
+  return EntraAuthConfig(
+    tenant_id=tenant_id,
+    client_id=client_id,
+    client_secret=client_secret,
+    session_secret=session_secret,
+    scopes=scopes,
+    secure_cookies=_env_flag("WORKIQ_WEB_AUTH_SECURE_COOKIES", default=False),
+  )
+
+
+AUTH_CONFIG = _load_auth_config()
+SessionMiddleware = None
+if AUTH_CONFIG is not None:
+  from starlette.middleware.sessions import SessionMiddleware
+
+
+def _build_msal_app(config: EntraAuthConfig) -> msal.ConfidentialClientApplication:
+  return msal.ConfidentialClientApplication(
+    client_id=config.client_id,
+    client_credential=config.client_secret,
+    authority=config.authority,
+  )
+
+
+def _build_login_url(request: Request) -> str:
+  next_path = request.url.path
+  if request.url.query:
+    next_path = f"{next_path}?{request.url.query}"
+  return str(request.url_for("auth_login").include_query_params(next=next_path))
+
+
+def _get_redirect_uri(request: Request) -> str:
+  explicit = os.environ.get("WORKIQ_WEB_AUTH_REDIRECT_URI", "").strip()
+  if explicit:
+    return explicit
+  return str(request.url_for("auth_callback"))
+
+
+def _session_user(request: Request) -> dict | None:
+  if AUTH_CONFIG is None:
+    return None
+  return request.session.get("user")
+
+
+def _require_browser_auth(request: Request) -> RedirectResponse | None:
+  if AUTH_CONFIG is None or _session_user(request):
+    return None
+  return RedirectResponse(_build_login_url(request), status_code=307)
+
+
+def _require_api_auth(request: Request) -> JSONResponse | None:
+  if AUTH_CONFIG is None or _session_user(request):
+    return None
+  return JSONResponse(
+    status_code=401,
+    content={
+      "detail": "Authentication required",
+      "login_url": _build_login_url(request),
+    },
+  )
+
+
+def _render_auth_error(message: str, *, status_code: int = 401) -> HTMLResponse:
+  safe_message = html.escape(message)
+  return HTMLResponse(
+    status_code=status_code,
+    content=(
+      "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+      "<title>Authentication Error</title>"
+      "<style>body{font-family:Segoe UI,system-ui,sans-serif;background:#0f1116;"
+      "color:#e6e6e6;display:grid;place-items:center;min-height:100vh;margin:0;}"
+      ".card{max-width:560px;padding:24px;border:1px solid #2a2d38;border-radius:12px;"
+      "background:#161922;}a{color:#6fb3ff;}</style></head><body>"
+      f"<div class=\"card\"><h1>Authentication failed</h1><p>{safe_message}</p>"
+      "<p><a href=\"/auth/login\">Try signing in again</a></p></div></body></html>"
+    ),
+  )
 
 
 def _truncate_text(value: str, limit: int = 220) -> str:
@@ -130,6 +293,10 @@ async def lifespan(app: FastAPI):
     app.state.build_lock = asyncio.Lock()
     # session_key -> AgentSession for conversation memory
     app.state.sessions = {}
+    # session_key -> cumulative total tokens used in this process
+    app.state.session_token_usage = {}
+    # session_key -> next unix timestamp when a request is allowed
+    app.state.session_next_allowed_at = {}
 
     # Warm up the default persona so the first request is fast.
     await get_persona_agent(app, PERSONA)
@@ -213,6 +380,14 @@ async def get_persona_agent(app: FastAPI, persona: str):
 
 
 app = FastAPI(title="Work IQ Orchestrator UI", lifespan=lifespan)
+if AUTH_CONFIG is not None:
+  app.add_middleware(
+    SessionMiddleware,
+    secret_key=AUTH_CONFIG.session_secret,
+    same_site="lax",
+    https_only=AUTH_CONFIG.secure_cookies,
+    max_age=8 * 60 * 60,
+  )
 
 
 class AskRequest(BaseModel):
@@ -222,23 +397,116 @@ class AskRequest(BaseModel):
 
 
 @app.get("/personas")
-async def personas() -> dict:
-    """List selectable personas (id + human label) for the UI dropdown."""
-    return {
-        "default": PERSONA,
-        "personas": [
-            {
-                "id": p["id"],
-                "label": p.get("label", p["id"]),
-                "description": p.get("description", ""),
-            }
-            for p in _scenario.personas
-        ],
-    }
+async def personas(request: Request):
+  """List selectable personas (id + human label) for the UI dropdown."""
+  auth = _require_api_auth(request)
+  if auth is not None:
+    return auth
+  return {
+    "default": PERSONA,
+    "personas": [
+      {
+        "id": p["id"],
+        "label": p.get("label", p["id"]),
+        "description": p.get("description", ""),
+      }
+      for p in _scenario.personas
+    ],
+  }
+
+
+@app.get("/auth/login", name="auth_login")
+async def auth_login(request: Request):
+    if AUTH_CONFIG is None:
+        return RedirectResponse(url="/", status_code=307)
+
+    try:
+        state = secrets.token_urlsafe(32)
+        next_path = request.query_params.get("next", "/")
+        if not next_path.startswith("/"):
+            next_path = "/"
+
+        request.session["auth_state"] = state
+        request.session["post_login_redirect"] = next_path
+
+        auth_url = _build_msal_app(AUTH_CONFIG).get_authorization_request_url(
+            scopes=list(AUTH_CONFIG.scopes),
+            state=state,
+            redirect_uri=_get_redirect_uri(request),
+            prompt="select_account",
+        )
+        return RedirectResponse(url=auth_url, status_code=307)
+    except Exception as exc:
+        logger.exception("Failed to build Microsoft login redirect")
+        return _render_auth_error(
+            "Could not start Microsoft sign-in. "
+            f"Check WORKIQ_WEB_AUTH_* settings. Details: {exc}",
+            status_code=500,
+        )
+
+
+@app.get("/auth/callback", name="auth_callback")
+async def auth_callback(request: Request):
+    if AUTH_CONFIG is None:
+        return RedirectResponse(url="/", status_code=307)
+
+    try:
+        error = request.query_params.get("error")
+        if error:
+            description = request.query_params.get("error_description") or error
+            return _render_auth_error(description)
+
+        state = request.query_params.get("state")
+        expected_state = request.session.get("auth_state")
+        if not state or state != expected_state:
+            return _render_auth_error("The sign-in response state did not match the original request.")
+
+        code = request.query_params.get("code")
+        if not code:
+            return _render_auth_error("The sign-in response did not include an authorization code.")
+
+        result = _build_msal_app(AUTH_CONFIG).acquire_token_by_authorization_code(
+            code=code,
+            scopes=list(AUTH_CONFIG.scopes),
+            redirect_uri=_get_redirect_uri(request),
+        )
+        if "error" in result:
+            description = result.get("error_description") or result["error"]
+            return _render_auth_error(description)
+
+        claims = result.get("id_token_claims") or {}
+        request.session.pop("auth_state", None)
+        request.session["user"] = {
+            "name": claims.get("name") or claims.get("preferred_username") or claims.get("oid") or "unknown",
+            "preferred_username": claims.get("preferred_username"),
+            "oid": claims.get("oid"),
+            "tid": claims.get("tid"),
+        }
+        destination = request.session.pop("post_login_redirect", "/")
+        if not isinstance(destination, str) or not destination.startswith("/"):
+            destination = "/"
+        return RedirectResponse(url=destination, status_code=307)
+    except Exception as exc:
+        logger.exception("Microsoft sign-in callback failed")
+        return _render_auth_error(
+            f"Microsoft sign-in callback failed: {exc}",
+            status_code=500,
+        )
+
+
+@app.get("/auth/logout")
+async def auth_logout(request: Request):
+    if AUTH_CONFIG is not None:
+        request.session.clear()
+    return RedirectResponse(url="/", status_code=307)
 
 
 @app.post("/ask")
-async def ask(req: AskRequest, request: Request) -> dict:
+async def ask(req: AskRequest, request: Request):
+    auth = _require_api_auth(request)
+    if auth is not None:
+        return auth
+
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="question is required")
@@ -253,6 +521,30 @@ async def ask(req: AskRequest, request: Request) -> dict:
     if session_key not in request.app.state.sessions:
         request.app.state.sessions[session_key] = AgentSession(session_id=session_key)
     session = request.app.state.sessions[session_key]
+    used_tokens = int(request.app.state.session_token_usage.get(session_key, 0))
+    now_ts = time.time()
+    next_allowed_at = float(request.app.state.session_next_allowed_at.get(session_key, 0.0))
+
+    if COOLDOWN_SECONDS > 0 and now_ts < next_allowed_at:
+      retry_after = max(int(next_allowed_at - now_ts), 1)
+      raise HTTPException(
+        status_code=429,
+        detail=(
+          "Cooldown active for this chat session. "
+          f"Try again in {retry_after}s."
+        ),
+        headers={"Retry-After": str(retry_after)},
+      )
+
+    if TOKEN_LIMIT_PER_SESSION > 0 and used_tokens >= TOKEN_LIMIT_PER_SESSION:
+      raise HTTPException(
+        status_code=429,
+        detail=(
+          "Token limit reached for this chat session "
+          f"({used_tokens}/{TOKEN_LIMIT_PER_SESSION}). "
+          "Start a new chat or increase WORKIQ_WEB_TOKEN_LIMIT."
+        ),
+      )
 
     started = time.perf_counter()
     elapsed_ms = 0.0
@@ -355,6 +647,12 @@ async def ask(req: AskRequest, request: Request) -> dict:
         answer_text,
     )
 
+    turn_total_tokens = int(usage.get("total_tokens", 0) or 0)
+    used_tokens_after = used_tokens + turn_total_tokens
+    request.app.state.session_token_usage[session_key] = used_tokens_after
+    if COOLDOWN_SECONDS > 0:
+      request.app.state.session_next_allowed_at[session_key] = time.time() + COOLDOWN_SECONDS
+
     return {
         "answer": answer_text,
         "persona": persona,
@@ -362,6 +660,15 @@ async def ask(req: AskRequest, request: Request) -> dict:
         "latency_ms": round(elapsed_ms, 2),
       "trail": tool_trail,
       "turn_started_at": turn_started_at,
+      "token_limit": TOKEN_LIMIT_PER_SESSION,
+      "tokens_used": used_tokens_after,
+      "tokens_remaining": (
+          max(TOKEN_LIMIT_PER_SESSION - used_tokens_after, 0)
+          if TOKEN_LIMIT_PER_SESSION > 0
+          else None
+      ),
+      "cooldown_seconds": COOLDOWN_SECONDS,
+      "next_allowed_at": request.app.state.session_next_allowed_at.get(session_key),
     }
 
 
@@ -471,12 +778,11 @@ INDEX_HTML = r"""<!doctype html>
   }
   button:disabled { background: #3a3f4f; cursor: not-allowed; }
   #usage {
-    position: fixed; right: 16px; bottom: 16px; z-index: 20;
-    width: 240px; background: rgba(18, 22, 31, 0.96);
-    border: 1px solid #2a2d38; border-radius: 12px;
-    padding: 12px 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    backdrop-filter: blur(10px);
+    margin: 0 8px 12px; background: rgba(18, 22, 31, 0.6);
+    border: 1px solid #2a2d38; border-radius: 10px;
+    padding: 12px 14px;
     font-size: 12px; line-height: 1.45;
+    flex-shrink: 0;
   }
   #usage .title { color: #9cc7ff; font-weight: 700; margin-bottom: 6px; }
   #usage .row { display: flex; justify-content: space-between; gap: 12px; }
@@ -503,7 +809,7 @@ INDEX_HTML = r"""<!doctype html>
     flex: 0 0 auto;
   }
   @media (max-width: 780px) {
-    #usage { left: 16px; right: 16px; bottom: 76px; width: auto; }
+    #usage { margin: 0 8px 12px; }
   }
   header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
   .persona-box { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
@@ -692,6 +998,19 @@ INDEX_HTML = r"""<!doctype html>
   <button id="clear-all" type="button">🗑 Clear all</button>
   <div class="sessions-label">Chats</div>
   <div id="sessions"></div>
+  <div style="border-top: 1px solid #2a2d38; margin: 8px 0;"></div>
+
+<aside id="usage" aria-live="polite">
+  <div class="title">Usage this session</div>
+  <div class="row"><span class="label">Turns <span class="info" title="How many questions you have sent in this session.">i</span></span><span class="value" id="u-turns">0</span></div>
+  <div class="row"><span class="label">Prompt tokens <span class="info" title="Tokens in your question and conversation context sent to the model.">i</span></span><span class="value" id="u-prompt">0</span></div>
+  <div class="row"><span class="label">Completion tokens <span class="info" title="Tokens generated by the model in its answer.">i</span></span><span class="value" id="u-completion">0</span></div>
+  <div class="row"><span class="label">Total tokens <span class="info" title="Prompt tokens + completion tokens for the turn.">i</span></span><span class="value" id="u-total">0</span></div>
+  <div class="row" id="u-remaining-row"><span class="label">Tokens remaining <span class="info" title="Remaining token budget for the current chat (if limit enabled).">i</span></span><span class="value" id="u-remaining">Unlimited</span></div>
+  <div class="row" id="u-cooldown-row"><span class="label">Cooldown <span class="info" title="Time until you can send the next message.">i</span></span><span class="value" id="u-cooldown">Ready</span></div>
+  <div class="row"><span class="label">Last latency <span class="info" title="How long the most recent request took end to end.">i</span></span><span class="value" id="u-latency">0 ms</span></div>
+  <div class="hint">Use this as a proxy for model credits consumed.</div>
+</aside>
 </div>
 
 <div id="main">
@@ -709,16 +1028,6 @@ INDEX_HTML = r"""<!doctype html>
   </header>
 
   <div id="log"></div>
-
-<aside id="usage" aria-live="polite">
-  <div class="title">Usage this session</div>
-  <div class="row"><span class="label">Turns <span class="info" title="How many questions you have sent in this session.">i</span></span><span class="value" id="u-turns">0</span></div>
-  <div class="row"><span class="label">Prompt tokens <span class="info" title="Tokens in your question and conversation context sent to the model.">i</span></span><span class="value" id="u-prompt">0</span></div>
-  <div class="row"><span class="label">Completion tokens <span class="info" title="Tokens generated by the model in its answer.">i</span></span><span class="value" id="u-completion">0</span></div>
-  <div class="row"><span class="label">Total tokens <span class="info" title="Prompt tokens + completion tokens for the turn.">i</span></span><span class="value" id="u-total">0</span></div>
-  <div class="row"><span class="label">Last latency <span class="info" title="How long the most recent request took end to end.">i</span></span><span class="value" id="u-latency">0 ms</span></div>
-  <div class="hint">Use this as a proxy for model credits consumed.</div>
-</aside>
 
 <form id="form">
   <textarea id="q" placeholder="Ask something — e.g. 'what's blocking PPAP qualification?'" required></textarea>
@@ -753,12 +1062,27 @@ const usageState = {
   promptTokens: 0,
   completionTokens: 0,
   totalTokens: 0,
+  tokenLimit: 0,
+  tokensRemaining: null,
 };
+const SERVER_CONFIG = "__WORKIQ_SERVER_CONFIG__";
+const uiConfig = (SERVER_CONFIG && SERVER_CONFIG.ui) || {};
+const clientCooldownEnabled = Boolean(uiConfig.enable_client_cooldown);
+const showCooldownTimer = Boolean(uiConfig.show_cooldown_timer);
+const showTokenRemaining = Boolean(uiConfig.show_token_remaining);
+const serverTokenLimit = Number(SERVER_CONFIG.token_limit || 0);
+const serverCooldownSeconds = Number(SERVER_CONFIG.cooldown_seconds || 0);
 const uTurns = document.getElementById('u-turns');
 const uPrompt = document.getElementById('u-prompt');
 const uCompletion = document.getElementById('u-completion');
 const uTotal = document.getElementById('u-total');
+const uRemaining = document.getElementById('u-remaining');
+const uRemainingRow = document.getElementById('u-remaining-row');
+const uCooldown = document.getElementById('u-cooldown');
+const uCooldownRow = document.getElementById('u-cooldown-row');
 const uLatency = document.getElementById('u-latency');
+let cooldownUntilMs = 0;
+let cooldownTimer = null;
 const trailModal = document.getElementById('trail-modal');
 const trailBody = document.getElementById('trail-body');
 const trailTitle = document.getElementById('trail-title');
@@ -805,6 +1129,10 @@ async function loadPersonas() {
   try {
     const r = await fetch('/personas');
     const data = await r.json();
+    if (r.status === 401 && data && data.login_url) {
+      window.location = data.login_url;
+      return;
+    }
     personaList = data.personas || [];
     defaultPersona = data.default;
   } catch (err) {
@@ -1059,7 +1387,52 @@ function refreshUsage(latencyMs) {
   uPrompt.textContent = String(usageState.promptTokens);
   uCompletion.textContent = String(usageState.completionTokens);
   uTotal.textContent = String(usageState.totalTokens);
+  if (showTokenRemaining && usageState.tokenLimit > 0) {
+    uRemainingRow.style.display = 'flex';
+    uRemaining.textContent = String(Math.max(Number(usageState.tokensRemaining || 0), 0));
+  } else if (showTokenRemaining) {
+    uRemainingRow.style.display = 'flex';
+    uRemaining.textContent = 'Unlimited';
+  } else {
+    uRemainingRow.style.display = 'none';
+  }
   uLatency.textContent = Number.isFinite(latencyMs) ? `${latencyMs.toFixed(0)} ms` : '0 ms';
+}
+
+function updateCooldownUi() {
+  if (!showCooldownTimer) {
+    uCooldownRow.style.display = 'none';
+    return;
+  }
+  uCooldownRow.style.display = 'flex';
+  const now = Date.now();
+  const remainingMs = Math.max(cooldownUntilMs - now, 0);
+  const remainingSec = Math.ceil(remainingMs / 1000);
+  if (remainingSec > 0) {
+    uCooldown.textContent = `${remainingSec}s`;
+    if (clientCooldownEnabled) send.disabled = true;
+  } else {
+    uCooldown.textContent = 'Ready';
+    if (clientCooldownEnabled) send.disabled = false;
+    if (cooldownTimer) {
+      clearInterval(cooldownTimer);
+      cooldownTimer = null;
+    }
+  }
+}
+
+function setCooldown(seconds) {
+  const sec = Number(seconds || 0);
+  if (sec <= 0) {
+    cooldownUntilMs = 0;
+    updateCooldownUi();
+    return;
+  }
+  cooldownUntilMs = Date.now() + (sec * 1000);
+  updateCooldownUi();
+  if (!cooldownTimer) {
+    cooldownTimer = setInterval(updateCooldownUi, 250);
+  }
 }
 newChatBtn.addEventListener('click', () => newChat(personaSel.value || defaultPersona));
 
@@ -1089,6 +1462,11 @@ form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = q.value.trim();
   if (!text) return;
+  if (clientCooldownEnabled && Date.now() < cooldownUntilMs) {
+    const secondsLeft = Math.ceil((cooldownUntilMs - Date.now()) / 1000);
+    add('error', 'cooldown active: try again in ' + String(secondsLeft) + 's');
+    return;
+  }
   let s = activeSession();
   if (!s) { newChat(defaultPersona); s = activeSession(); }
 
@@ -1124,7 +1502,15 @@ form.addEventListener('submit', async (e) => {
     } catch {
       data = null;
     }
+    if (r.status === 401 && data && data.login_url) {
+      window.location = data.login_url;
+      return;
+    }
     if (!r.ok) {
+      if (r.status === 429) {
+        const retryAfter = Number(r.headers.get('Retry-After') || 0);
+        if (retryAfter > 0) setCooldown(retryAfter);
+      }
       throw new Error((data && data.detail) || raw || ('HTTP ' + r.status));
     }
     const turnUsage = (data && data.usage) || {};
@@ -1133,6 +1519,15 @@ form.addEventListener('submit', async (e) => {
     usageState.promptTokens += Number(turnUsage.prompt_tokens || 0);
     usageState.completionTokens += Number(turnUsage.completion_tokens || 0);
     usageState.totalTokens += Number(turnUsage.total_tokens || 0);
+    usageState.tokenLimit = Number((data && data.token_limit) || serverTokenLimit || 0);
+    usageState.tokensRemaining = (data && data.tokens_remaining) == null ? null : Number(data.tokens_remaining);
+    const nextAllowedAt = Number((data && data.next_allowed_at) || 0);
+    if (nextAllowedAt > 0) {
+      const remaining = Math.max(nextAllowedAt - (Date.now() / 1000), 0);
+      setCooldown(remaining);
+    } else if (serverCooldownSeconds > 0) {
+      setCooldown(serverCooldownSeconds);
+    }
     refreshUsage(Number(data && data.latency_ms));
     placeholder.classList.remove('thinking');
     let answer = ((data && data.answer) || raw || '(no answer)').replace(/https:\/\/simulator\.local\//g, '/citation/');
@@ -1163,7 +1558,9 @@ form.addEventListener('submit', async (e) => {
     add('error', 'error: ' + escape(String(err.message || err)));
   } finally {
     persistActiveHtml();
-    send.disabled = false;
+    if (!clientCooldownEnabled || Date.now() >= cooldownUntilMs) {
+      send.disabled = false;
+    }
     q.focus();
   }
 });
@@ -1196,6 +1593,14 @@ q.addEventListener('keydown', (e) => {
 
 // ---- boot ----------------------------------------------------------------- //
 (async function init() {
+  usageState.tokenLimit = serverTokenLimit;
+  usageState.tokensRemaining = serverTokenLimit > 0 ? serverTokenLimit : null;
+  refreshUsage(NaN);
+  if (serverCooldownSeconds > 0) {
+    setCooldown(0);
+  } else {
+    updateCooldownUi();
+  }
   await loadPersonas();
   loadState();
   if (!state.sessions.length) {
@@ -1228,13 +1633,28 @@ window.addEventListener('storage', (e) => {
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    return INDEX_HTML
+async def index(request: Request):
+    auth = _require_browser_auth(request)
+    if auth is not None:
+        return auth
+    server_config = {
+      "token_limit": TOKEN_LIMIT_PER_SESSION,
+      "cooldown_seconds": COOLDOWN_SECONDS,
+      "ui": {
+        "enable_client_cooldown": UI_ENABLE_CLIENT_COOLDOWN,
+        "show_cooldown_timer": UI_SHOW_COOLDOWN_TIMER,
+        "show_token_remaining": UI_SHOW_TOKEN_REMAINING,
+      },
+    }
+    return INDEX_HTML.replace('"__WORKIQ_SERVER_CONFIG__"', json.dumps(server_config))
 
 
 @app.get("/citation/{kind}/{cid}", response_class=HTMLResponse)
-async def citation_detail(kind: str, cid: str) -> str:
+async def citation_detail(kind: str, cid: str, request: Request) -> str:
     """Serve a simple HTML page showing the full citation record."""
+    auth = _require_browser_auth(request)
+    if auth is not None:
+        return auth
     record = _scenario.index.get(cid)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Citation {cid} not found")
@@ -1268,12 +1688,16 @@ async def citation_detail(kind: str, cid: str) -> str:
 
 
 def main() -> int:
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(
         "web:app",
-        host="127.0.0.1",
-        port=8000,
+        host=host,
+        port=port,
         reload=False,
         log_level="info",
+    proxy_headers=True,
+    forwarded_allow_ips="*",
     )
     return 0
 

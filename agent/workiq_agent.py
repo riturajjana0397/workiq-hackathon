@@ -49,6 +49,7 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -56,7 +57,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 import httpx
 
-from azure.identity.aio import AzureCliCredential, get_bearer_token_provider
+from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
 
 # Microsoft Agent Framework imports — verified against the installed version.
 from agent_framework import Agent, MCPStdioTool
@@ -74,7 +75,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------- #
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 MCP_SCRIPT = REPO_ROOT / "simulator" / "server.py"
 
 FOUNDRY_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get(
@@ -163,7 +163,7 @@ Scope guardrail (STRICT):
 def build_chat_client() -> OpenAIChatClient:
     """Construct an OpenAI-compatible chat client backed by Azure AI Foundry.
 
-    Auth: AzureCliCredential -> bearer token provider against
+    Auth: DefaultAzureCredential -> bearer token provider against
     https://ai.azure.com/.default. Tokens refresh automatically because the
     openai SDK accepts a callable for `api_key`.
 
@@ -174,7 +174,7 @@ def build_chat_client() -> OpenAIChatClient:
             "AZURE_OPENAI_ENDPOINT (or AZURE_AI_FOUNDRY_ENDPOINT) is not set. "
             "Set it to your Foundry /openai/v1 endpoint."
         )
-    credential = AzureCliCredential()
+    credential = DefaultAzureCredential()
     token_provider = get_bearer_token_provider(
         credential, "https://ai.azure.com/.default"
     )
@@ -193,15 +193,36 @@ def build_chat_client() -> OpenAIChatClient:
 # Tool surfaces                                                                #
 # ---------------------------------------------------------------------------- #
 
+def _resolve_python_command() -> str:
+    """Resolve a Python executable that works in both local and container runs."""
+    override = os.environ.get("WORKIQ_PYTHON")
+    if override:
+        return override
+
+    candidates = [
+        REPO_ROOT / ".venv" / "Scripts" / "python.exe",  # Windows dev
+        REPO_ROOT / ".venv" / "bin" / "python",          # Linux/macOS dev
+        Path(sys.executable),                                # Current runtime
+    ]
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            return str(candidate)
+
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    raise RuntimeError(
+        "No Python interpreter found for launching simulator/server.py. "
+        "Set WORKIQ_PYTHON to an executable path if needed."
+    )
+
 def build_mcp_tool(persona: str | None = None) -> MCPStdioTool:
     """Spawn the local Work IQ MCP server as a child process and surface its
     tools to the model. Persona is injected via env so RBAC kicks in.
     """
-    if not VENV_PY.exists():
-        raise RuntimeError(
-            f"Python interpreter not found at {VENV_PY}. "
-            "Activate or recreate the .venv first."
-        )
+    python_cmd = _resolve_python_command()
     if not MCP_SCRIPT.exists():
         raise RuntimeError(f"MCP server script not found at {MCP_SCRIPT}")
 
@@ -211,7 +232,7 @@ def build_mcp_tool(persona: str | None = None) -> MCPStdioTool:
             "Local Work IQ simulator (MCP stdio). Tools: ask_work_iq, fetch, "
             "create_entity, update_entity."
         ),
-        command=str(VENV_PY),
+        command=python_cmd,
         args=[str(MCP_SCRIPT)],
         env={
             **os.environ,
