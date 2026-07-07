@@ -44,9 +44,11 @@ from telemetry import extract_usage, record_usage, setup_telemetry, span_context
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
-if not VENV_PY.exists():
-    VENV_PY = REPO_ROOT / ".venv" / "bin" / "python"
+PYTHON_CMD = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+if not PYTHON_CMD.exists():
+    PYTHON_CMD = REPO_ROOT / ".venv" / "bin" / "python"
+if not PYTHON_CMD.exists() and sys.executable:
+    PYTHON_CMD = Path(sys.executable)
 MCP_SCRIPT = REPO_ROOT / "simulator" / "server.py"
 
 HOST = os.environ.get("WORKIQ_PLANNER_HOST", "127.0.0.1")
@@ -169,8 +171,8 @@ def _split_answer_and_citations(text: str) -> tuple[str, list]:
 
 
 def _build_mcp_tool(persona: str | None = None) -> MCPStdioTool:
-    if not VENV_PY.exists():
-        raise RuntimeError(f"Python interpreter not found at {VENV_PY}")
+    if not PYTHON_CMD.exists():
+        raise RuntimeError(f"Python interpreter not found at {PYTHON_CMD}")
     if not MCP_SCRIPT.exists():
         raise RuntimeError(f"MCP server script not found at {MCP_SCRIPT}")
     return MCPStdioTool(
@@ -179,7 +181,7 @@ def _build_mcp_tool(persona: str | None = None) -> MCPStdioTool:
             "Local Work IQ simulator (MCP stdio). Tools: ask_work_iq, fetch, "
             "create_entity, update_entity."
         ),
-        command=str(VENV_PY),
+        command=str(PYTHON_CMD),
         args=[str(MCP_SCRIPT)],
         env={
             **os.environ,
@@ -222,24 +224,34 @@ async def _setup():
             prompt = question
         mcp_tool = _build_mcp_tool(persona)
         simulator_a2a = _build_simulator_a2a(persona)
-        async with mcp_tool, simulator_a2a:
-            agent = ChatAgent(
-                client,
-                instructions=INSTRUCTIONS,
-                name="workiq-planner",
-                tools=[mcp_tool, simulator_a2a.as_tool()],
-            )
-            with telemetry.tracer.start_as_current_span(
-                "workiq.subagent.planner",
-                attributes=span_context_attributes(subagent="planner", persona=persona),
-            ) as span:
-                response = await agent.run(prompt)
-                raw = (getattr(response, "text", None) or str(response)).strip()
-                usage = record_usage(telemetry, response, span=span)
-                if not usage:
-                    usage = _usage_from_maf(response)
-                print(f"[workiq-planner] usage={usage}", file=sys.stderr)
-                span.set_attribute("workiq.subagent", "planner")
+        try:
+            async with mcp_tool:
+                agent = ChatAgent(
+                    client,
+                    instructions=INSTRUCTIONS,
+                    name="workiq-planner",
+                    tools=[mcp_tool, simulator_a2a.as_tool()],
+                )
+                with telemetry.tracer.start_as_current_span(
+                    "workiq.subagent.planner",
+                    attributes=span_context_attributes(subagent="planner", persona=persona),
+                ) as span:
+                    response = await agent.run(prompt)
+                    raw = (getattr(response, "text", None) or str(response)).strip()
+                    usage = record_usage(telemetry, response, span=span)
+                    if not usage:
+                        usage = _usage_from_maf(response)
+                    print(f"[workiq-planner] usage={usage}", file=sys.stderr)
+                    span.set_attribute("workiq.subagent", "planner")
+        finally:
+            a2a_http_client = getattr(simulator_a2a, "http_client", None)
+            if a2a_http_client is None:
+                a2a_http_client = getattr(simulator_a2a, "_http_client", None)
+            if a2a_http_client is not None and hasattr(a2a_http_client, "aclose"):
+                try:
+                    await a2a_http_client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
         answer, citations = _split_answer_and_citations(raw)
         return {
             "response": answer,
