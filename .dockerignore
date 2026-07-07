@@ -1,0 +1,10 @@
+.git
+.venv
+.vscode
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/*.log
+challenge-pack/
+starter-kit/

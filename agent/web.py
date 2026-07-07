@@ -26,14 +26,19 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 import time
 
+import msal
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 # Make the sibling workiq_agent module importable when running from repo root.
@@ -62,6 +67,207 @@ _scenario = load_scenario(REPO_ROOT / "simulator" / SCENARIO)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int = 0) -> int:
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  try:
+    parsed = int(value.strip())
+  except (TypeError, ValueError):
+    logger.warning("Invalid %s=%r; using default %d", name, value, default)
+    return default
+  return parsed if parsed >= 0 else 0
+
+
+TOKEN_LIMIT_PER_SESSION = _env_int("WORKIQ_WEB_TOKEN_LIMIT", default=0)
+COOLDOWN_SECONDS = _env_int("WORKIQ_WEB_COOLDOWN_SECONDS", default=0)
+UI_ENABLE_CLIENT_COOLDOWN = _env_flag("WORKIQ_WEB_UI_ENABLE_CLIENT_COOLDOWN", default=True)
+UI_SHOW_COOLDOWN_TIMER = _env_flag("WORKIQ_WEB_UI_SHOW_COOLDOWN_TIMER", default=True)
+UI_SHOW_TOKEN_REMAINING = _env_flag("WORKIQ_WEB_UI_SHOW_TOKEN_REMAINING", default=True)
+
+
+@dataclass(frozen=True)
+class EntraAuthConfig:
+  tenant_id: str
+  client_id: str
+  client_secret: str
+  session_secret: str
+  scopes: tuple[str, ...]
+  secure_cookies: bool
+
+  @property
+  def authority(self) -> str:
+    return f"https://login.microsoftonline.com/{self.tenant_id}"
+
+
+def _load_auth_config() -> EntraAuthConfig | None:
+  if not _env_flag("WORKIQ_WEB_AUTH_ENABLED", default=False):
+    return None
+
+  client_id = os.environ.get("WORKIQ_WEB_AUTH_CLIENT_ID", "").strip()
+  client_secret = os.environ.get("WORKIQ_WEB_AUTH_CLIENT_SECRET", "").strip()
+  tenant_id = os.environ.get("WORKIQ_WEB_AUTH_TENANT_ID", "").strip()
+  session_secret = os.environ.get("WORKIQ_WEB_AUTH_SESSION_SECRET", "").strip()
+  configured = {
+    "WORKIQ_WEB_AUTH_CLIENT_ID": client_id,
+    "WORKIQ_WEB_AUTH_CLIENT_SECRET": client_secret,
+    "WORKIQ_WEB_AUTH_TENANT_ID": tenant_id,
+    "WORKIQ_WEB_AUTH_SESSION_SECRET": session_secret,
+  }
+  present = [name for name, value in configured.items() if value]
+  if not present:
+    return None
+
+  missing = [name for name, value in configured.items() if not value]
+  if missing:
+    raise RuntimeError(
+      "Microsoft Entra web auth is partially configured. Missing: "
+      + ", ".join(missing)
+    )
+  if len(session_secret) < 32:
+    raise RuntimeError(
+      "WORKIQ_WEB_AUTH_SESSION_SECRET must be at least 32 characters long."
+    )
+
+  scopes_raw = os.environ.get(
+    "WORKIQ_WEB_AUTH_SCOPES",
+    "email",
+  )
+  reserved_scopes = {"openid", "profile", "offline_access"}
+  scopes = tuple(part for part in scopes_raw.split() if part and part.lower() not in reserved_scopes)
+  if not scopes:
+    scopes = ("email",)
+
+  return EntraAuthConfig(
+    tenant_id=tenant_id,
+    client_id=client_id,
+    client_secret=client_secret,
+    session_secret=session_secret,
+    scopes=scopes,
+    secure_cookies=_env_flag("WORKIQ_WEB_AUTH_SECURE_COOKIES", default=False),
+  )
+
+
+AUTH_CONFIG = _load_auth_config()
+SessionMiddleware = None
+if AUTH_CONFIG is not None:
+  from starlette.middleware.sessions import SessionMiddleware
+
+
+def _build_msal_app(config: EntraAuthConfig) -> msal.ConfidentialClientApplication:
+  return msal.ConfidentialClientApplication(
+    client_id=config.client_id,
+    client_credential=config.client_secret,
+    authority=config.authority,
+  )
+
+
+def _build_login_url(request: Request) -> str:
+  next_path = request.url.path
+  if request.url.query:
+    next_path = f"{next_path}?{request.url.query}"
+  return str(request.url_for("auth_login").include_query_params(next=next_path))
+
+
+def _get_redirect_uri(request: Request) -> str:
+  explicit = os.environ.get("WORKIQ_WEB_AUTH_REDIRECT_URI", "").strip()
+  if explicit:
+    return explicit
+  return str(request.url_for("auth_callback"))
+
+
+def _session_user(request: Request) -> dict | None:
+  if AUTH_CONFIG is None:
+    return None
+  return request.session.get("user")
+
+
+def _require_browser_auth(request: Request) -> RedirectResponse | None:
+  if AUTH_CONFIG is None or _session_user(request):
+    return None
+  return RedirectResponse(_build_login_url(request), status_code=307)
+
+
+def _require_api_auth(request: Request) -> JSONResponse | None:
+  if AUTH_CONFIG is None or _session_user(request):
+    return None
+  return JSONResponse(
+    status_code=401,
+    content={
+      "detail": "Authentication required",
+      "login_url": _build_login_url(request),
+    },
+  )
+
+
+def _render_auth_error(message: str, *, status_code: int = 401) -> HTMLResponse:
+  safe_message = html.escape(message)
+  return HTMLResponse(
+    status_code=status_code,
+    content=(
+      "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+      "<title>Authentication Error</title>"
+      "<style>body{font-family:Segoe UI,system-ui,sans-serif;background:#0f1116;"
+      "color:#e6e6e6;display:grid;place-items:center;min-height:100vh;margin:0;}"
+      ".card{max-width:560px;padding:24px;border:1px solid #2a2d38;border-radius:12px;"
+      "background:#161922;}a{color:#6fb3ff;}</style></head><body>"
+      f"<div class=\"card\"><h1>Authentication failed</h1><p>{safe_message}</p>"
+      "<p><a href=\"/auth/login\">Try signing in again</a></p></div></body></html>"
+    ),
+  )
+
+
+def _truncate_text(value: str, limit: int = 220) -> str:
+  if len(value) <= limit:
+    return value
+  return value[: limit - 1] + "..."
+
+
+def _json_safe(value):
+  """Convert runtime objects into JSON-serializable, compact values."""
+  if value is None or isinstance(value, (str, int, float, bool)):
+    return value
+  if isinstance(value, Decimal):
+    return float(value)
+  if isinstance(value, dict):
+    return {str(k): _json_safe(v) for k, v in value.items()}
+  if isinstance(value, (list, tuple, set)):
+    return [_json_safe(v) for v in value]
+  # Handle Content objects from agent_framework
+  if hasattr(value, "text") and hasattr(value, "content_type"):
+    try:
+      return _json_safe({"text": getattr(value, "text", ""), "content_type": getattr(value, "content_type", "unknown")})
+    except Exception:
+      pass
+  # Handle dataclass or Pydantic models
+  if hasattr(value, "model_dump"):
+    try:
+      return _json_safe(value.model_dump())
+    except Exception:
+      pass
+  if hasattr(value, "dict"):
+    try:
+      return _json_safe(value.dict())
+    except Exception:
+      pass
+  # For objects with __dict__, try to extract readable attributes
+  if hasattr(value, "__dict__"):
+    try:
+      attrs = {k: _json_safe(v) for k, v in value.__dict__.items() if not k.startswith("_")}
+      if attrs:
+        return attrs
+    except Exception:
+      pass
+  return _truncate_text(str(value), 400)
 
 # ---------------------------------------------------------------------------- #
 # Lifespan: build the agent once, tear it down cleanly on shutdown.            #
@@ -94,6 +300,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Work IQ Orchestrator UI", lifespan=lifespan)
+if AUTH_CONFIG is not None:
+  app.add_middleware(
+    SessionMiddleware,
+    secret_key=AUTH_CONFIG.session_secret,
+    same_site="lax",
+    https_only=AUTH_CONFIG.secure_cookies,
+    max_age=8 * 60 * 60,
+  )
 
 
 class AskRequest(BaseModel):
@@ -103,23 +317,116 @@ class AskRequest(BaseModel):
 
 
 @app.get("/personas")
-async def personas() -> dict:
-    """List selectable personas (id + human label) for the UI dropdown."""
-    return {
-        "default": PERSONA,
-        "personas": [
-            {
-                "id": p["id"],
-                "label": p.get("label", p["id"]),
-                "description": p.get("description", ""),
-            }
-            for p in _scenario.personas
-        ],
-    }
+async def personas(request: Request):
+  """List selectable personas (id + human label) for the UI dropdown."""
+  auth = _require_api_auth(request)
+  if auth is not None:
+    return auth
+  return {
+    "default": PERSONA,
+    "personas": [
+      {
+        "id": p["id"],
+        "label": p.get("label", p["id"]),
+        "description": p.get("description", ""),
+      }
+      for p in _scenario.personas
+    ],
+  }
+
+
+@app.get("/auth/login", name="auth_login")
+async def auth_login(request: Request):
+    if AUTH_CONFIG is None:
+        return RedirectResponse(url="/", status_code=307)
+
+    try:
+        state = secrets.token_urlsafe(32)
+        next_path = request.query_params.get("next", "/")
+        if not next_path.startswith("/"):
+            next_path = "/"
+
+        request.session["auth_state"] = state
+        request.session["post_login_redirect"] = next_path
+
+        auth_url = _build_msal_app(AUTH_CONFIG).get_authorization_request_url(
+            scopes=list(AUTH_CONFIG.scopes),
+            state=state,
+            redirect_uri=_get_redirect_uri(request),
+            prompt="select_account",
+        )
+        return RedirectResponse(url=auth_url, status_code=307)
+    except Exception as exc:
+        logger.exception("Failed to build Microsoft login redirect")
+        return _render_auth_error(
+            "Could not start Microsoft sign-in. "
+            f"Check WORKIQ_WEB_AUTH_* settings. Details: {exc}",
+            status_code=500,
+        )
+
+
+@app.get("/auth/callback", name="auth_callback")
+async def auth_callback(request: Request):
+    if AUTH_CONFIG is None:
+        return RedirectResponse(url="/", status_code=307)
+
+    try:
+        error = request.query_params.get("error")
+        if error:
+            description = request.query_params.get("error_description") or error
+            return _render_auth_error(description)
+
+        state = request.query_params.get("state")
+        expected_state = request.session.get("auth_state")
+        if not state or state != expected_state:
+            return _render_auth_error("The sign-in response state did not match the original request.")
+
+        code = request.query_params.get("code")
+        if not code:
+            return _render_auth_error("The sign-in response did not include an authorization code.")
+
+        result = _build_msal_app(AUTH_CONFIG).acquire_token_by_authorization_code(
+            code=code,
+            scopes=list(AUTH_CONFIG.scopes),
+            redirect_uri=_get_redirect_uri(request),
+        )
+        if "error" in result:
+            description = result.get("error_description") or result["error"]
+            return _render_auth_error(description)
+
+        claims = result.get("id_token_claims") or {}
+        request.session.pop("auth_state", None)
+        request.session["user"] = {
+            "name": claims.get("name") or claims.get("preferred_username") or claims.get("oid") or "unknown",
+            "preferred_username": claims.get("preferred_username"),
+            "oid": claims.get("oid"),
+            "tid": claims.get("tid"),
+        }
+        destination = request.session.pop("post_login_redirect", "/")
+        if not isinstance(destination, str) or not destination.startswith("/"):
+            destination = "/"
+        return RedirectResponse(url=destination, status_code=307)
+    except Exception as exc:
+        logger.exception("Microsoft sign-in callback failed")
+        return _render_auth_error(
+            f"Microsoft sign-in callback failed: {exc}",
+            status_code=500,
+        )
+
+
+@app.get("/auth/logout")
+async def auth_logout(request: Request):
+    if AUTH_CONFIG is not None:
+        request.session.clear()
+    return RedirectResponse(url="/", status_code=307)
 
 
 @app.post("/ask")
-async def ask(req: AskRequest, request: Request) -> dict:
+async def ask(req: AskRequest, request: Request):
+    auth = _require_api_auth(request)
+    if auth is not None:
+        return auth
+
     q = (req.question or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="question is required")
@@ -143,6 +450,43 @@ async def ask(req: AskRequest, request: Request) -> dict:
     elapsed_ms = 0.0
     usage: dict[str, int] = {}
     answer_text = ""
+    tool_trail: list[dict] = []
+    turn_started_at = datetime.now(timezone.utc).isoformat()
+
+    @function_middleware
+    async def _tool_trace_middleware(context, call_next):
+      tool_started = time.perf_counter()
+      call_id = context.metadata.get("call_id")
+      args = _json_safe(context.arguments)
+      status = "ok"
+      error = None
+      try:
+        await call_next()
+      except Exception as exc:
+        status = "error"
+        error = str(exc)
+        raise
+      finally:
+        duration_ms = (time.perf_counter() - tool_started) * 1000
+        result_obj = getattr(context, "result", None)
+        result_serialized = _json_safe(result_obj)
+        result_preview = _truncate_text(
+          str(result_serialized) if result_serialized is not None else "",
+          220
+        )
+        tool_trail.append(
+          {
+            "index": len(tool_trail) + 1,
+            "tool": context.function.name,
+            "call_id": call_id,
+            "status": status,
+            "duration_ms": round(duration_ms, 2),
+            "args": args,
+            "result_preview": result_preview,
+            "error": _truncate_text(error, 220) if error else None,
+          }
+        )
+
     try:
         with telemetry.tracer.start_as_current_span(
             "workiq.web.ask",
@@ -211,11 +555,28 @@ async def ask(req: AskRequest, request: Request) -> dict:
         answer_text,
     )
 
+    turn_total_tokens = int(usage.get("total_tokens", 0) or 0)
+    used_tokens_after = used_tokens + turn_total_tokens
+    request.app.state.session_token_usage[session_key] = used_tokens_after
+    if COOLDOWN_SECONDS > 0:
+      request.app.state.session_next_allowed_at[session_key] = time.time() + COOLDOWN_SECONDS
+
     return {
         "answer": answer_text,
         "persona": persona,
         "usage": usage,
         "latency_ms": round(elapsed_ms, 2),
+      "trail": tool_trail,
+      "turn_started_at": turn_started_at,
+      "token_limit": TOKEN_LIMIT_PER_SESSION,
+      "tokens_used": used_tokens_after,
+      "tokens_remaining": (
+          max(TOKEN_LIMIT_PER_SESSION - used_tokens_after, 0)
+          if TOKEN_LIMIT_PER_SESSION > 0
+          else None
+      ),
+      "cooldown_seconds": COOLDOWN_SECONDS,
+      "next_allowed_at": request.app.state.session_next_allowed_at.get(session_key),
     }
 
 
@@ -325,12 +686,11 @@ INDEX_HTML = r"""<!doctype html>
   }
   button:disabled { background: #3a3f4f; cursor: not-allowed; }
   #usage {
-    position: fixed; right: 16px; bottom: 16px; z-index: 20;
-    width: 240px; background: rgba(18, 22, 31, 0.96);
-    border: 1px solid #2a2d38; border-radius: 12px;
-    padding: 12px 14px; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-    backdrop-filter: blur(10px);
+    margin: 0 8px 12px; background: rgba(18, 22, 31, 0.6);
+    border: 1px solid #2a2d38; border-radius: 10px;
+    padding: 12px 14px;
     font-size: 12px; line-height: 1.45;
+    flex-shrink: 0;
   }
   #usage .title { color: #9cc7ff; font-weight: 700; margin-bottom: 6px; }
   #usage .row { display: flex; justify-content: space-between; gap: 12px; }
@@ -357,7 +717,7 @@ INDEX_HTML = r"""<!doctype html>
     flex: 0 0 auto;
   }
   @media (max-width: 780px) {
-    #usage { left: 16px; right: 16px; bottom: 76px; width: auto; }
+    #usage { margin: 0 8px 12px; }
   }
   header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
   .persona-box { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
@@ -371,6 +731,169 @@ INDEX_HTML = r"""<!doctype html>
   #persona-desc { font-size: 11px; color: #8a8f9c; max-width: 360px; text-align: right; }
   #persona-lock { font-size: 10px; color: #d9a441; }
   .empty-state { color: #5a6173; text-align: center; margin-top: 80px; font-size: 14px; }
+  .trail-row {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px dashed #2f3445;
+    font-size: 12px;
+    color: #8a8f9c;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .trail-row .trail-num {
+    border: 1px solid #355aa0;
+    background: #1a2f56;
+    color: #9cc7ff;
+    border-radius: 999px;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 8px;
+    font-size: 12px;
+    line-height: 22px;
+    cursor: pointer;
+    font-weight: 700;
+  }
+  .trail-row .trail-num:hover { background: #234277; }
+  .trail-row .trail-meta { color: #7f8697; }
+  #trail-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 40;
+    padding: 16px;
+  }
+  #trail-modal.open { display: flex; }
+  .trail-panel {
+    width: min(840px, 100%);
+    max-height: 82vh;
+    overflow: auto;
+    background: #111623;
+    border: 1px solid #2a2d38;
+    border-radius: 12px;
+    box-shadow: 0 20px 44px rgba(0, 0, 0, 0.45);
+  }
+  .trail-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 16px;
+    border-bottom: 1px solid #252a36;
+  }
+  .trail-head h3 { margin: 0; font-size: 15px; }
+  .trail-close {
+    border: 1px solid #3a4051;
+    background: transparent;
+    color: #cfd4e3;
+    border-radius: 8px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  .trail-body { padding: 14px 16px 16px; }
+  .trail-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .trail-kpi {
+    background: #161b29;
+    border: 1px solid #2a2f3d;
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .trail-kpi .k { color: #8a8f9c; font-size: 11px; }
+  .trail-kpi .v { color: #e6e6e6; font-weight: 700; margin-top: 2px; }
+  .call {
+    border: 1px solid #2a2f3d;
+    background: #151a27;
+    border-radius: 10px;
+    padding: 10px;
+    margin-top: 10px;
+  }
+  .call-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .call-title { color: #9cc7ff; font-weight: 700; }
+  .call-time { color: #d9e3f8; font-variant-numeric: tabular-nums; }
+  .call pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #0d111b;
+    border: 1px solid #252a36;
+    padding: 8px;
+    border-radius: 8px;
+    color: #cfd4e3;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .json-section {
+    margin-top: 8px;
+    background: #0d111b;
+    border: 1px solid #252a36;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .json-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    background: #161b29;
+    border-bottom: 1px solid #252a36;
+    cursor: pointer;
+    user-select: none;
+  }
+  .json-header:hover { background: #1c2235; }
+  .json-toggle {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    line-height: 14px;
+    text-align: center;
+    color: #8a8f9c;
+    font-size: 10px;
+  }
+  .json-header.collapsed .json-toggle::after { content: '▶'; }
+  .json-header:not(.collapsed) .json-toggle::after { content: '▼'; }
+  .json-header-label { font-size: 12px; color: #9cc7ff; font-weight: 600; }
+  .json-body {
+    padding: 10px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .json-header.collapsed ~ .json-body { display: none; }
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .status-ok {
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+  }
+  .status-error {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+  }
+  .status-ok::before { content: '✓'; }
+  .status-error::before { content: '✕'; }
 </style>
 </head>
 <body>
@@ -383,6 +906,19 @@ INDEX_HTML = r"""<!doctype html>
   <button id="clear-all" type="button">🗑 Clear all</button>
   <div class="sessions-label">Chats</div>
   <div id="sessions"></div>
+  <div style="border-top: 1px solid #2a2d38; margin: 8px 0;"></div>
+
+<aside id="usage" aria-live="polite">
+  <div class="title">Usage this session</div>
+  <div class="row"><span class="label">Turns <span class="info" title="How many questions you have sent in this session.">i</span></span><span class="value" id="u-turns">0</span></div>
+  <div class="row"><span class="label">Prompt tokens <span class="info" title="Tokens in your question and conversation context sent to the model.">i</span></span><span class="value" id="u-prompt">0</span></div>
+  <div class="row"><span class="label">Completion tokens <span class="info" title="Tokens generated by the model in its answer.">i</span></span><span class="value" id="u-completion">0</span></div>
+  <div class="row"><span class="label">Total tokens <span class="info" title="Prompt tokens + completion tokens for the turn.">i</span></span><span class="value" id="u-total">0</span></div>
+  <div class="row" id="u-remaining-row"><span class="label">Tokens remaining <span class="info" title="Remaining token budget for the current chat (if limit enabled).">i</span></span><span class="value" id="u-remaining">Unlimited</span></div>
+  <div class="row" id="u-cooldown-row"><span class="label">Cooldown <span class="info" title="Time until you can send the next message.">i</span></span><span class="value" id="u-cooldown">Ready</span></div>
+  <div class="row"><span class="label">Last latency <span class="info" title="How long the most recent request took end to end.">i</span></span><span class="value" id="u-latency">0 ms</span></div>
+  <div class="hint">Use this as a proxy for model credits consumed.</div>
+</aside>
 </div>
 
 <div id="main">
@@ -420,6 +956,16 @@ INDEX_HTML = r"""<!doctype html>
 </form>
 </div>
 
+<div id="trail-modal" aria-hidden="true" role="dialog" aria-label="Execution trail details">
+  <div class="trail-panel">
+    <div class="trail-head">
+      <h3 id="trail-title">Execution trail</h3>
+      <button class="trail-close" id="trail-close" type="button">Close</button>
+    </div>
+    <div class="trail-body" id="trail-body"></div>
+  </div>
+</div>
+
 <script>
 const log        = document.getElementById('log');
 const form       = document.getElementById('form');
@@ -441,6 +987,13 @@ const usageState = {
   plannerTokens: 0,
   citationTokens: 0,
 };
+const SERVER_CONFIG = "__WORKIQ_SERVER_CONFIG__";
+const uiConfig = (SERVER_CONFIG && SERVER_CONFIG.ui) || {};
+const clientCooldownEnabled = Boolean(uiConfig.enable_client_cooldown);
+const showCooldownTimer = Boolean(uiConfig.show_cooldown_timer);
+const showTokenRemaining = Boolean(uiConfig.show_token_remaining);
+const serverTokenLimit = Number(SERVER_CONFIG.token_limit || 0);
+const serverCooldownSeconds = Number(SERVER_CONFIG.cooldown_seconds || 0);
 const uTurns = document.getElementById('u-turns');
 const uPrompt = document.getElementById('u-prompt');
 const uCompletion = document.getElementById('u-completion');
@@ -449,6 +1002,12 @@ const uIntent = document.getElementById('u-intent');
 const uPlanner = document.getElementById('u-planner');
 const uCitation = document.getElementById('u-citation');
 const uLatency = document.getElementById('u-latency');
+let cooldownUntilMs = 0;
+let cooldownTimer = null;
+const trailModal = document.getElementById('trail-modal');
+const trailBody = document.getElementById('trail-body');
+const trailTitle = document.getElementById('trail-title');
+const trailClose = document.getElementById('trail-close');
 
 const STORE_KEY = 'workiq_sessions_v2';
 let personaList = [];
@@ -491,6 +1050,10 @@ async function loadPersonas() {
   try {
     const r = await fetch('/personas');
     const data = await r.json();
+    if (r.status === 401 && data && data.login_url) {
+      window.location = data.login_url;
+      return;
+    }
     personaList = data.personas || [];
     defaultPersona = data.default;
   } catch (err) {
@@ -575,6 +1138,7 @@ function newChat(persona) {
     persona: persona || personaSel.value || defaultPersona,
     title: 'New chat',
     html: '',
+    trails: {},
   };
   state.sessions.unshift(s);
   state.activeId = s.id;
@@ -616,6 +1180,113 @@ function add(kind, html) {
   return div;
 }
 
+function toPrettyJson(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (err) {
+    return String(value);
+  }
+}
+
+function formatArgs(args) {
+  if (!args || typeof args !== 'object') return escape(String(args || ''));
+  if (Array.isArray(args)) {
+    return args.map(item => escape(String(item))).join('\n');
+  }
+  // Format as plain key: value pairs
+  const pairs = Object.entries(args).map(([k, v]) => {
+    let val;
+    if (typeof v === 'object' && v !== null) {
+      val = JSON.stringify(v);
+    } else {
+      val = String(v);
+    }
+    return escape(k) + ': ' + escape(val);
+  });
+  return pairs.join('\n');
+}
+
+function formatPreviewValue(val) {
+  if (val === null || val === undefined) return '(empty)';
+  if (typeof val === 'string') return val;
+  if (typeof val === 'number' || typeof val === 'boolean') return String(val);
+  if (Array.isArray(val)) {
+    // For arrays of objects, show key: value pairs per item
+    if (val.length === 0) return '(empty array)';
+    if (typeof val[0] === 'object' && val[0] !== null) {
+      return val.map((item, i) => {
+        if (typeof item === 'object') {
+          const pairs = Object.entries(item).map(([k, v]) => k + ': ' + String(v)).join(', ');
+          return pairs;
+        }
+        return String(item);
+      }).join('\n');
+    }
+    return val.join(', ');
+  }
+  if (typeof val === 'object') {
+    // For plain objects, show as key: value pairs
+    const pairs = Object.entries(val).map(([k, v]) => {
+      if (typeof v === 'object') return k + ': ' + JSON.stringify(v);
+      return k + ': ' + String(v);
+    });
+    return pairs.join('\n');
+  }
+  return String(val);
+}
+
+function renderTrailModal(trailEntry) {
+  if (!trailEntry) return;
+  const calls = Array.isArray(trailEntry.tool_calls) ? trailEntry.tool_calls : [];
+  trailTitle.textContent = 'Execution trail #' + trailEntry.turn;
+  const summaryHtml =
+    '<div class="trail-summary">' +
+      '<div class="trail-kpi"><div class="k">Question</div><div class="v" style="word-break:break-word;font-weight:400;margin-top:6px;">' + escape((trailEntry.question || '').substring(0, 60)) + (trailEntry.question && trailEntry.question.length > 60 ? '...' : '') + '</div></div>' +
+      '<div class="trail-kpi"><div class="k">Persona</div><div class="v">' + escape(trailEntry.persona || '') + '</div></div>' +
+      '<div class="trail-kpi"><div class="k">Tool calls</div><div class="v">' + String(calls.length) + '</div></div>' +
+      '<div class="trail-kpi"><div class="k">Turn latency</div><div class="v">' + Number(trailEntry.latency_ms || 0).toFixed(0) + ' ms</div></div>' +
+    '</div>';
+
+  const callsHtml = calls.length
+    ? calls.map(call => {
+        const statusClass = (call.status === 'error' ? 'status-error' : 'status-ok');
+        const argsText = formatArgs(call.args || {});
+        const resultPreviewVal = call.result_preview ? formatPreviewValue(call.result_preview) : '';
+        const callId = call.call_id ? escape(String(call.call_id)) : '—';
+        const errorMsg = call.error ? escape(String(call.error)) : null;
+        return (
+          '<div class="call">' +
+            '<div class="call-head">' +
+              '<div>' +
+                '<div style="color:#9cc7ff;font-weight:700;">' + String(call.index || '?') + '. ' + escape(String(call.tool || 'unknown')) + '</div>' +
+                '<div style="font-size:10px;color:#7f8697;margin-top:2px;">call: ' + callId + '</div>' +
+              '</div>' +
+              '<div style="text-align:right;">' +
+                '<div class="' + statusClass + ' status-badge">' + (call.status === 'error' ? 'Error' : 'Success') + '</div>' +
+                '<div style="font-size:11px;color:#d9e3f8;margin-top:4px;font-variant-numeric:tabular-nums;">' + Number(call.duration_ms || 0).toFixed(2) + ' ms</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="json-section">' +
+              '<div class="json-header" onclick="this.classList.toggle(\'collapsed\');"><span class="json-toggle"></span><span class="json-header-label">Arguments</span></div>' +
+              '<div class="json-body" style="color:#7f8697;white-space:pre-wrap;word-wrap:break-word;">' + argsText + '</div>' +
+            '</div>' +
+            (resultPreviewVal ? '<div class="json-section"><div class="json-header" onclick="this.classList.toggle(\'collapsed\');"><span class="json-toggle"></span><span class="json-header-label">Result preview</span></div><div class="json-body" style="color:#7f8697;white-space:pre-wrap;word-wrap:break-word;">' + resultPreviewVal + '</div></div>' : '') +
+            (errorMsg ? '<div style="margin-top:8px;padding:8px;background:rgba(239,68,68,0.1);border-left:2px solid #ef4444;color:#fca5a5;font-size:11px;"><span style="color:#ef4444;font-weight:600;">Error:</span> ' + errorMsg + '</div>' : '') +
+          '</div>'
+        );
+      }).join('')
+    : '<div class="call" style="text-align:center;padding:20px;color:#7f8697;">No tool calls were made for this turn.</div>';
+
+  trailBody.innerHTML = summaryHtml + callsHtml;
+  trailModal.classList.add('open');
+  trailModal.setAttribute('aria-hidden', 'false');
+}
+
+function hideTrailModal() {
+  trailModal.classList.remove('open');
+  trailModal.setAttribute('aria-hidden', 'true');
+}
+
 // ---- persona dropdown: changing persona starts a NEW chat ----------------- //
 personaSel.addEventListener('change', () => {
   const s = activeSession();
@@ -642,6 +1313,42 @@ function refreshUsage(latencyMs) {
   uCitation.textContent = String(usageState.citationTokens);
   uLatency.textContent = Number.isFinite(latencyMs) ? `${latencyMs.toFixed(0)} ms` : '0 ms';
 }
+
+function updateCooldownUi() {
+  if (!showCooldownTimer) {
+    uCooldownRow.style.display = 'none';
+    return;
+  }
+  uCooldownRow.style.display = 'flex';
+  const now = Date.now();
+  const remainingMs = Math.max(cooldownUntilMs - now, 0);
+  const remainingSec = Math.ceil(remainingMs / 1000);
+  if (remainingSec > 0) {
+    uCooldown.textContent = `${remainingSec}s`;
+    if (clientCooldownEnabled) send.disabled = true;
+  } else {
+    uCooldown.textContent = 'Ready';
+    if (clientCooldownEnabled) send.disabled = false;
+    if (cooldownTimer) {
+      clearInterval(cooldownTimer);
+      cooldownTimer = null;
+    }
+  }
+}
+
+function setCooldown(seconds) {
+  const sec = Number(seconds || 0);
+  if (sec <= 0) {
+    cooldownUntilMs = 0;
+    updateCooldownUi();
+    return;
+  }
+  cooldownUntilMs = Date.now() + (sec * 1000);
+  updateCooldownUi();
+  if (!cooldownTimer) {
+    cooldownTimer = setInterval(updateCooldownUi, 250);
+  }
+}
 newChatBtn.addEventListener('click', () => newChat(personaSel.value || defaultPersona));
 
 document.getElementById('clear-all').addEventListener('click', () => {
@@ -655,6 +1362,7 @@ document.getElementById('clear-all').addEventListener('click', () => {
     persona: defaultPersona || personaSel.value,
     title: 'New chat',
     html: '',
+    trails: {},
   };
   state.sessions = [s];
   state.activeId = s.id;
@@ -669,6 +1377,11 @@ form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = q.value.trim();
   if (!text) return;
+  if (clientCooldownEnabled && Date.now() < cooldownUntilMs) {
+    const secondsLeft = Math.ceil((cooldownUntilMs - Date.now()) / 1000);
+    add('error', 'cooldown active: try again in ' + String(secondsLeft) + 's');
+    return;
+  }
   let s = activeSession();
   if (!s) { newChat(defaultPersona); s = activeSession(); }
 
@@ -704,11 +1417,20 @@ form.addEventListener('submit', async (e) => {
     } catch {
       data = null;
     }
+    if (r.status === 401 && data && data.login_url) {
+      window.location = data.login_url;
+      return;
+    }
     if (!r.ok) {
+      if (r.status === 429) {
+        const retryAfter = Number(r.headers.get('Retry-After') || 0);
+        if (retryAfter > 0) setCooldown(retryAfter);
+      }
       throw new Error((data && data.detail) || raw || ('HTTP ' + r.status));
     }
     const turnUsage = (data && data.usage) || {};
     usageState.turns += 1;
+    const turnNumber = usageState.turns;
     usageState.promptTokens += Number(turnUsage.prompt_tokens || 0);
     usageState.completionTokens += Number(turnUsage.completion_tokens || 0);
     usageState.totalTokens += Number(turnUsage.total_tokens || 0);
@@ -721,14 +1443,54 @@ form.addEventListener('submit', async (e) => {
     let answer = ((data && data.answer) || raw || '(no answer)').replace(/https:\/\/simulator\.local\//g, '/citation/');
     placeholder.innerHTML = marked.parse(answer);
     placeholder.querySelectorAll('a[href^="/citation/"]').forEach(a => a.target = '_blank');
+
+    if (!s.trails) s.trails = {};
+    const trailEntry = {
+      turn: turnNumber,
+      question: text,
+      persona: persona,
+      latency_ms: Number(data && data.latency_ms) || 0,
+      turn_started_at: (data && data.turn_started_at) || null,
+      tool_calls: (data && data.trail) || [],
+    };
+    s.trails[String(turnNumber)] = trailEntry;
+    const toolCallCount = Array.isArray(trailEntry.tool_calls) ? trailEntry.tool_calls.length : 0;
+    const trailNote = document.createElement('div');
+    trailNote.className = 'trail-row';
+    trailNote.innerHTML =
+      '<span>trail</span>' +
+      '<button class="trail-num" type="button" data-turn="' + String(turnNumber) + '">' + String(turnNumber) + '</button>' +
+      '<span class="trail-meta">' + String(toolCallCount) + ' tool call' + (toolCallCount === 1 ? '' : 's') +
+      ' • ' + Number(trailEntry.latency_ms).toFixed(0) + ' ms</span>';
+    placeholder.appendChild(trailNote);
   } catch (err) {
     placeholder.remove();
     add('error', 'error: ' + escape(String(err.message || err)));
   } finally {
     persistActiveHtml();
-    send.disabled = false;
+    if (!clientCooldownEnabled || Date.now() >= cooldownUntilMs) {
+      send.disabled = false;
+    }
     q.focus();
   }
+});
+
+log.addEventListener('click', (e) => {
+  const btn = e.target.closest('.trail-num');
+  if (!btn) return;
+  const s = activeSession();
+  if (!s || !s.trails) return;
+  const turn = btn.getAttribute('data-turn');
+  if (!turn) return;
+  renderTrailModal(s.trails[turn]);
+});
+
+trailClose.addEventListener('click', hideTrailModal);
+trailModal.addEventListener('click', (e) => {
+  if (e.target === trailModal) hideTrailModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') hideTrailModal();
 });
 
 // submit on Enter, newline on Shift+Enter
@@ -741,6 +1503,14 @@ q.addEventListener('keydown', (e) => {
 
 // ---- boot ----------------------------------------------------------------- //
 (async function init() {
+  usageState.tokenLimit = serverTokenLimit;
+  usageState.tokensRemaining = serverTokenLimit > 0 ? serverTokenLimit : null;
+  refreshUsage(NaN);
+  if (serverCooldownSeconds > 0) {
+    setCooldown(0);
+  } else {
+    updateCooldownUi();
+  }
   await loadPersonas();
   loadState();
   if (!state.sessions.length) {
@@ -773,13 +1543,28 @@ window.addEventListener('storage', (e) => {
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    return INDEX_HTML
+async def index(request: Request):
+    auth = _require_browser_auth(request)
+    if auth is not None:
+        return auth
+    server_config = {
+      "token_limit": TOKEN_LIMIT_PER_SESSION,
+      "cooldown_seconds": COOLDOWN_SECONDS,
+      "ui": {
+        "enable_client_cooldown": UI_ENABLE_CLIENT_COOLDOWN,
+        "show_cooldown_timer": UI_SHOW_COOLDOWN_TIMER,
+        "show_token_remaining": UI_SHOW_TOKEN_REMAINING,
+      },
+    }
+    return INDEX_HTML.replace('"__WORKIQ_SERVER_CONFIG__"', json.dumps(server_config))
 
 
 @app.get("/citation/{kind}/{cid}", response_class=HTMLResponse)
-async def citation_detail(kind: str, cid: str) -> str:
+async def citation_detail(kind: str, cid: str, request: Request) -> str:
     """Serve a simple HTML page showing the full citation record."""
+    auth = _require_browser_auth(request)
+    if auth is not None:
+        return auth
     record = _scenario.index.get(cid)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Citation {cid} not found")
@@ -821,12 +1606,16 @@ async def citation_detail(kind: str, cid: str) -> str:
 
 
 def main() -> int:
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(
         "web:app",
-        host="127.0.0.1",
-        port=8000,
+        host=host,
+        port=port,
         reload=False,
         log_level="info",
+    proxy_headers=True,
+    forwarded_allow_ips="*",
     )
     return 0
 

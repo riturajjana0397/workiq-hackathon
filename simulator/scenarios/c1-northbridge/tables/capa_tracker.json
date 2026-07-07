@@ -103,6 +103,321 @@
         "quality_pm",
         "credentialing_lead"
       ]
+    },
+    {
+      "action": "Finalize and publish the revised medication-reconciliation policy - Risk identified: Needs timely completion to avoid delays in patient care",
+      "committee": "quality_steering",
+      "owner": "PPL-005",
+      "status": "Open",
+      "opened_date": "2026-06-10",
+      "due_date": "2026-06-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-008"
+    },
+    {
+      "action": "Complete Westgate environment-of-care documentation for Joint Commission - Risk identified: Delay could lead to non-compliance",
+      "committee": "quality_steering",
+      "owner": "PPL-007",
+      "status": "Open",
+      "opened_date": "2026-06-10",
+      "due_date": "2026-06-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-009"
+    },
+    {
+      "action": "Validate Westgate medication-list data migration before EHR go-live - Risk identified: Migration errors could affect patient data accuracy",
+      "committee": "ehr_program",
+      "owner": "PPL-010",
+      "status": "Open",
+      "opened_date": "2026-06-10",
+      "due_date": "2026-06-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-010"
+    },
+    {
+      "action": "Finalize and publish the revised medication-reconciliation policy - Risk identified: Needs timely completion to avoid delays in patient care",
+      "committee": "quality_steering",
+      "owner": "PPL-005",
+      "status": "Open",
+      "opened_date": "2026-06-10",
+      "due_date": "2026-06-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-011"
+    },
+    {
+      "action": "Complete Westgate environment-of-care documentation for Joint Commission - Risk identified: Delay could lead to non-compliance",
+      "committee": "quality_steering",
+      "owner": "PPL-007",
+      "status": "Open",
+      "opened_date": "2026-06-10",
+      "due_date": "2026-06-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-012"
+    },
+    {
+      "action": "Validate Westgate medication-list data migration before EHR go-live - Risk identified: Migration errors could affect patient data accuracy",
+      "committee": "ehr_program",
+      "owner": "PPL-010",
+      "status": "Open",
+      "opened_date": "2026-06-10",
+      "due_date": "2026-06-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-013"
+    },
+    {
+      "action": "Ensure timely completion of revised medication-reconciliation policy to avoid delays in patient care",
+      "committee": "quality_steering",
+      "owner": "PPL-005",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-014"
+    },
+    {
+      "action": "Complete Westgate environment-of-care documentation to prevent non-compliance",
+      "committee": "quality_steering",
+      "owner": "PPL-007",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-015"
+    },
+    {
+      "action": "Ensure accurate migration of Westgate medication-list data before EHR go-live to prevent patient data errors",
+      "committee": "ehr_program",
+      "owner": "PPL-010",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-016"
+    },
+    {
+      "action": "Finalize and publish the revised medication-reconciliation policy to avoid delays in patient care.",
+      "committee": "quality_steering",
+      "owner": "PPL-005",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-017"
+    },
+    {
+      "action": "Complete Westgate environment-of-care documentation to prevent non-compliance.",
+      "committee": "quality_steering",
+      "owner": "PPL-007",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-018"
+    },
+    {
+      "action": "Ensure accurate migration of Westgate medication-list data before EHR go-live to prevent patient data errors.",
+      "committee": "ehr_program",
+      "owner": "PPL-010",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-019"
+    },
+    {
+      "action": "Ensure timely completion of revised medication-reconciliation policy to avoid delays in patient care",
+      "committee": "quality_steering",
+      "owner": "PPL-005",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-020"
+    },
+    {
+      "action": "Complete Westgate environment-of-care documentation to prevent non-compliance",
+      "committee": "quality_steering",
+      "owner": "PPL-007",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-021"
+    },
+    {
+      "action": "Ensure accurate migration of Westgate medication-list data before EHR go-live to prevent patient data errors",
+      "committee": "ehr_program",
+      "owner": "PPL-010",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-022"
+    },
+    {
+      "action": "Ensure timely completion of revised medication-reconciliation policy to avoid delays in patient care",
+      "committee": "quality_steering",
+      "owner": "PPL-005",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-023"
+    },
+    {
+      "action": "Complete Westgate environment-of-care documentation to prevent non-compliance",
+      "committee": "quality_steering",
+      "owner": "PPL-007",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-024"
+    },
+    {
+      "action": "Ensure accurate migration of Westgate medication-list data before EHR go-live to prevent patient data errors",
+      "committee": "ehr_program",
+      "owner": "PPL-010",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-025"
+    },
+    {
+      "action": "Ensure timely completion of revised medication-reconciliation policy to avoid delays in patient care",
+      "committee": "quality_steering",
+      "owner": "PPL-005",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-026"
+    },
+    {
+      "action": "Complete Westgate environment-of-care documentation to prevent non-compliance",
+      "committee": "quality_steering",
+      "owner": "PPL-007",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-027"
+    },
+    {
+      "action": "Ensure accurate migration of Westgate medication-list data before EHR go-live to prevent patient data errors",
+      "committee": "ehr_program",
+      "owner": "PPL-010",
+      "status": "Open",
+      "opened_date": "2023-10-10",
+      "due_date": "2023-10-20",
+      "past_due": false,
+      "acl": [
+        "ops_director",
+        "quality_pm",
+        "credentialing_lead"
+      ],
+      "id": "CAPA-028"
     }
   ]
 }

@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+msal
+itsdangerous
+agent-framework
+agent-framework-foundry
+agent-framework-a2a
+azure-identity
+openai
+httpx
+mcp
+azure-monitor-opentelemetry
+numpy>=1.26         # Required by simulator/engine.py for scenario loading and embeddings

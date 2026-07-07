@@ -9,3 +9,4 @@
 
 mcp>=1.27           # MCP Python SDK (FastMCP stdio server + client)
 openai>=1.0         # OPTIONAL: ad-hoc LLM fallback for non-golden questions
+numpy>=1.26         # Required by simulator/engine.py for embeddings and vector ops

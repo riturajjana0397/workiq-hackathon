@@ -1,0 +1,132 @@
+=====================================build,push,deploy================================================================
+
+LOCAL
+
+Web app local env:
+WORKIQ_WEB_AUTH_ENABLED="false"
+AZURE_EXPERIMENTAL_ENABLE_GENAI_TRACING="true"
+AZURE_AI_FOUNDRY_ENDPOINT="https://<your-endpoint>/openai/v1"
+AZURE_AI_FOUNDRY_DEPLOYMENT="gpt-4o-mini"
+WORKIQ_SIM_PERSONA="quality_pm"
+WORKIQ_A2A_CARD="http://127.0.0.1:8920/.well-known/agent-card.json"
+
+Suggested local run order:
+1. Start the simulator A2A server.
+2. Set WORKIQ_WEB_AUTH_ENABLED="false".
+3. Run .\.venv\Scripts\python.exe agent\web.py
+
+
+PRODUCTION / AZURE CONTAINER APPS
+
+Build and push images:
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-a2a:$TAG -f deploy/A2AAgent/Dockerfile .; docker tag workiq-a2a:$TAG ${ACR}/workiq-a2a:${TAG}; docker push ${ACR}/workiq-a2a:${TAG}
+
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-web:$TAG -f deploy/AgentWebUI/Dockerfile .; docker tag workiq-web:$TAG ${ACR}/workiq-web:${TAG}; docker push ${ACR}/workiq-web:${TAG}
+
+=======================================================================================================
+
+Bootstrap infra:
+az login
+az group create -n %RG% -l %LOC%
+az acr create -n %ACR% -g %RG% --sku Basic
+az containerapp env create -n %ENV% -g %RG% -l %LOC%
+
+Push images to ACR:
+az acr login -n %ACR%
+
+docker tag workiq-web:latest %ACR%.azurecr.io/workiq-web:latest
+docker tag workiq-a2a:latest %ACR%.azurecr.io/workiq-a2a:latest
+
+docker push %ACR%.azurecr.io/workiq-web:latest
+docker push %ACR%.azurecr.io/workiq-a2a:latest
+
+Deploy A2A app first:
+az containerapp create ^
+-n workiq-a2a ^
+-g %RG% ^
+--environment %ENV% ^
+--image %ACR%.azurecr.io/workiq-a2a:latest ^
+--target-port 8920 ^
+--ingress external ^
+--registry-server %ACR%.azurecr.io ^
+--query properties.configuration.ingress.fqdn -o tsv
+
+Save the returned FQDN as A2A_FQDN.
+
+Production web env:
+WORKIQ_WEB_AUTH_ENABLED="true"
+WORKIQ_WEB_AUTH_CLIENT_ID="<app-registration-client-id>"
+WORKIQ_WEB_AUTH_TENANT_ID="<tenant-id>"
+WORKIQ_WEB_AUTH_SCOPES="email" (optional; reserved scopes openid/profile are automatically filtered)
+WORKIQ_WEB_AUTH_SECURE_COOKIES="true"
+WORKIQ_WEB_AUTH_CLIENT_SECRET="<store as ACA secret>"
+WORKIQ_WEB_AUTH_SESSION_SECRET="<store as ACA secret, at least 32 chars>"
+AZURE_AI_FOUNDRY_ENDPOINT="https://<your-endpoint>/openai/v1"
+AZURE_AI_FOUNDRY_DEPLOYMENT="gpt-4o-mini"
+WORKIQ_SIM_PERSONA="quality_pm"
+WORKIQ_A2A_CARD="https://<A2A_FQDN>/.well-known/agent-card.json"
+AZURE_EXPERIMENTAL_ENABLE_GENAI_TRACING="true"
+APPLICATIONINSIGHTS_CONNECTION_STRING="<your-app-insights-connection-string>"
+
+App registration redirect URI:
+https://ca-workiq-web.kindflower-d01d7cf7.eastus.azurecontainerapps.io/auth/callback
+
+Set ACA secrets before enabling Entra auth:
+az containerapp secret set ^
+--name workiq-web ^
+--resource-group %RG% ^
+--secrets ^
+workiq-auth-client-secret="<app-registration-client-secret>" ^
+workiq-auth-session-secret="<long-random-session-secret>"
+
+Deploy web app:
+az containerapp create ^
+-n workiq-web ^
+-g %RG% ^
+--environment %ENV% ^
+--image %ACR%.azurecr.io/workiq-web:latest ^
+--target-port 8000 ^
+--ingress external ^
+--registry-server %ACR%.azurecr.io ^
+--env-vars ^
+AZURE_AI_FOUNDRY_ENDPOINT="https://<your-endpoint>/openai/v1" ^
+AZURE_AI_FOUNDRY_DEPLOYMENT="gpt-4o-mini" ^
+WORKIQ_SIM_PERSONA="quality_pm" ^
+WORKIQ_A2A_CARD="https://<A2A_FQDN>/.well-known/agent-card.json" ^
+AZURE_EXPERIMENTAL_ENABLE_GENAI_TRACING="true" ^
+APPLICATIONINSIGHTS_CONNECTION_STRING="<your-app-insights-connection-string>" ^
+WORKIQ_WEB_AUTH_ENABLED="true" ^
+WORKIQ_WEB_AUTH_CLIENT_ID="<app-registration-client-id>" ^
+WORKIQ_WEB_AUTH_TENANT_ID="<tenant-id>" ^
+WORKIQ_WEB_AUTH_SCOPES="email" ^
+WORKIQ_WEB_AUTH_SECURE_COOKIES="true" ^
+WORKIQ_WEB_AUTH_CLIENT_SECRET=secretref:workiq-auth-client-secret ^
+WORKIQ_WEB_AUTH_SESSION_SECRET=secretref:workiq-auth-session-secret
+
+If the web app already exists, update env vars instead:
+az containerapp update ^
+--name workiq-web ^
+--resource-group %RG% ^
+--set-env-vars ^
+AZURE_AI_FOUNDRY_ENDPOINT="https://<your-endpoint>/openai/v1" ^
+AZURE_AI_FOUNDRY_DEPLOYMENT="gpt-4o-mini" ^
+WORKIQ_SIM_PERSONA="quality_pm" ^
+WORKIQ_A2A_CARD="https://<A2A_FQDN>/.well-known/agent-card.json" ^
+AZURE_EXPERIMENTAL_ENABLE_GENAI_TRACING="true" ^
+APPLICATIONINSIGHTS_CONNECTION_STRING="<your-app-insights-connection-string>" ^
+WORKIQ_WEB_AUTH_ENABLED="true" ^
+WORKIQ_WEB_AUTH_CLIENT_ID="<app-registration-client-id>" ^
+WORKIQ_WEB_AUTH_TENANT_ID="<tenant-id>" ^
+WORKIQ_WEB_AUTH_SCOPES="email" ^
+WORKIQ_WEB_AUTH_SECURE_COOKIES="true" ^
+WORKIQ_WEB_AUTH_CLIENT_SECRET=secretref:workiq-auth-client-secret ^
+WORKIQ_WEB_AUTH_SESSION_SECRET=secretref:workiq-auth-session-secret
+
+Verify:
+Get URLs:
+az containerapp show -n workiq-web -g %RG% --query properties.configuration.ingress.fqdn -o tsv
+az containerapp show -n workiq-a2a -g %RG% --query properties.configuration.ingress.fqdn -o tsv
+
+Check logs:
+az containerapp logs show -n workiq-web -g %RG% --follow
+az containerapp logs show -n workiq-a2a -g %RG% --follow
