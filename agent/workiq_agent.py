@@ -286,7 +286,7 @@ async def orchestrate(
     citation_payload = json.dumps({"draft": draft, "citations": citations})
     with telemetry.tracer.start_as_current_span(
         "workiq.orchestrator.citation",
-        attributes=span_context_attributes(hop="citation", persona=PERSONA),
+        attributes=span_context_attributes(hop="citation", persona=persona),
     ) as span:
         cite_msg = await _a2a_send(
             http, CITATION_URL, citation_payload, metadata=meta, context_id=context_id

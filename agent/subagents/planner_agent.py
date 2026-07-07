@@ -45,6 +45,8 @@ from telemetry import extract_usage, record_usage, setup_telemetry, span_context
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+if not VENV_PY.exists():
+    VENV_PY = REPO_ROOT / ".venv" / "bin" / "python"
 MCP_SCRIPT = REPO_ROOT / "simulator" / "server.py"
 
 HOST = os.environ.get("WORKIQ_PLANNER_HOST", "127.0.0.1")
@@ -166,7 +168,7 @@ def _split_answer_and_citations(text: str) -> tuple[str, list]:
     return answer, citations
 
 
-def _build_mcp_tool() -> MCPStdioTool:
+def _build_mcp_tool(persona: str | None = None) -> MCPStdioTool:
     if not VENV_PY.exists():
         raise RuntimeError(f"Python interpreter not found at {VENV_PY}")
     if not MCP_SCRIPT.exists():
@@ -181,15 +183,15 @@ def _build_mcp_tool() -> MCPStdioTool:
         args=[str(MCP_SCRIPT)],
         env={
             **os.environ,
-            "WORKIQ_SIM_PERSONA": PERSONA,
+            "WORKIQ_SIM_PERSONA": persona or PERSONA,
             "WORKIQ_SIM_SCENARIO": SCENARIO,
         },
     )
 
 
-def _build_simulator_a2a() -> A2AAgent:
+def _build_simulator_a2a(persona: str | None = None) -> A2AAgent:
     base_url = A2A_CARD_URL.split("/.well-known/", 1)[0]
-    headers = {"X-WorkIQ-Persona": PERSONA}
+    headers = {"X-WorkIQ-Persona": persona or PERSONA}
     http_client = httpx.AsyncClient(headers=headers, timeout=60.0)
     return A2AAgent(
         name="workiq-a2a",
@@ -204,26 +206,13 @@ def _build_simulator_a2a() -> A2AAgent:
 
 async def _setup():
     client = build_chat_client()
-    mcp_tool = _build_mcp_tool()
-    simulator_a2a = _build_simulator_a2a()
     telemetry = setup_telemetry("workiq-planner")
-
-    # Keep tool surfaces open for the process lifetime. Entered here (not per
-    # request) so subprocesses / HTTP clients are reused across turns.
-    await mcp_tool.__aenter__()
-    await simulator_a2a.__aenter__()
-
-    agent = ChatAgent(
-        client,
-        instructions=INSTRUCTIONS,
-        name="workiq-planner",
-        tools=[mcp_tool, simulator_a2a.as_tool()],
-    )
 
     async def handle(question: str, meta: dict) -> dict:
         # The orchestrator passes intent JSON in the message body already; we
         # additionally accept it via metadata for programmatic callers.
         intent_meta = meta.get("intent") if isinstance(meta, dict) else None
+        persona = str(meta.get("persona") or PERSONA).strip() if isinstance(meta, dict) else PERSONA
         if intent_meta:
             prompt = (
                 f"intent: {json.dumps(intent_meta, separators=(',', ':'))}\n\n"
@@ -231,17 +220,26 @@ async def _setup():
             )
         else:
             prompt = question
-        with telemetry.tracer.start_as_current_span(
-            "workiq.subagent.planner",
-            attributes=span_context_attributes(subagent="planner"),
-        ) as span:
-            response = await agent.run(prompt)
-            raw = (getattr(response, "text", None) or str(response)).strip()
-            usage = record_usage(telemetry, response, span=span)
-            if not usage:
-                usage = _usage_from_maf(response)
-            print(f"[workiq-planner] usage={usage}", file=sys.stderr)
-            span.set_attribute("workiq.subagent", "planner")
+        mcp_tool = _build_mcp_tool(persona)
+        simulator_a2a = _build_simulator_a2a(persona)
+        async with mcp_tool, simulator_a2a:
+            agent = ChatAgent(
+                client,
+                instructions=INSTRUCTIONS,
+                name="workiq-planner",
+                tools=[mcp_tool, simulator_a2a.as_tool()],
+            )
+            with telemetry.tracer.start_as_current_span(
+                "workiq.subagent.planner",
+                attributes=span_context_attributes(subagent="planner", persona=persona),
+            ) as span:
+                response = await agent.run(prompt)
+                raw = (getattr(response, "text", None) or str(response)).strip()
+                usage = record_usage(telemetry, response, span=span)
+                if not usage:
+                    usage = _usage_from_maf(response)
+                print(f"[workiq-planner] usage={usage}", file=sys.stderr)
+                span.set_attribute("workiq.subagent", "planner")
         answer, citations = _split_answer_and_citations(raw)
         return {
             "response": answer,

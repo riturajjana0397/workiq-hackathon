@@ -24,6 +24,7 @@ Same as workiq_agent.py:
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -787,8 +788,16 @@ async def citation_detail(kind: str, cid: str) -> str:
     title = data.get("subject") or data.get("title") or data.get("name") or cid
     body = data.get("body") or data.get("recap") or data.get("text") or data.get("summary") or data.get("content_excerpt") or ""
     meta_fields = {k: v for k, v in data.items() if k not in ("body", "recap", "text", "summary", "content_excerpt", "acl")}
+    esc_kind = html.escape(str(_kind))
+    esc_cid = html.escape(str(cid))
+    esc_title = html.escape(str(title))
+    esc_body = html.escape(str(body))
+    meta_html = "".join(
+        f"<dt>{html.escape(str(k))}</dt><dd>{html.escape(str(v))}</dd>"
+        for k, v in meta_fields.items()
+    )
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>{cid} — {title}</title>
+<html><head><meta charset="utf-8"><title>{esc_cid} — {esc_title}</title>
 <style>
   body {{ font-family: -apple-system, 'Segoe UI', sans-serif; background: #0f1116; color: #e6e6e6; padding: 40px; max-width: 800px; margin: 0 auto; }}
   h1 {{ color: #9cc7ff; font-size: 20px; }}
@@ -800,9 +809,9 @@ async def citation_detail(kind: str, cid: str) -> str:
   a {{ color: #6fb3ff; }}
 </style></head><body>
 <a href="/">&larr; Back to chat</a>
-<h1><span class="badge">{_kind}</span> {cid} — {title}</h1>
-<dl class="meta">{''.join(f'<dt>{k}</dt><dd>{v}</dd>' for k, v in meta_fields.items())}</dl>
-<div class="body">{body}</div>
+<h1><span class="badge">{esc_kind}</span> {esc_cid} — {esc_title}</h1>
+<dl class="meta">{meta_html}</dl>
+<div class="body">{esc_body}</div>
 </body></html>"""
 
 
