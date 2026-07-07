@@ -130,3 +130,133 @@ az containerapp show -n workiq-a2a -g %RG% --query properties.configuration.ingr
 Check logs:
 az containerapp logs show -n workiq-web -g %RG% --follow
 az containerapp logs show -n workiq-a2a -g %RG% --follow
+
+
+================================================================ SPLIT-SUBAGENT TOPOLOGY =================================================================
+
+Target apps in one ACA environment:
+- workiq-web (external, port 8000)
+- workiq-a2a (internal, port 8920)
+- workiq-intent (internal, port 8930)
+- workiq-planner (internal, port 8931)
+- workiq-citation (internal, port 8932)
+
+Build and push all images (PowerShell):
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-a2a:$TAG -f deploy/A2AAgent/Dockerfile .; docker tag workiq-a2a:$TAG ${ACR}/workiq-a2a:${TAG}; docker push ${ACR}/workiq-a2a:${TAG}
+
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-web:$TAG -f deploy/AgentWebUI/Dockerfile .; docker tag workiq-web:$TAG ${ACR}/workiq-web:${TAG}; docker push ${ACR}/workiq-web:${TAG}
+
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-intent:$TAG -f deploy/Subagents/IntentSvc/Dockerfile .; docker tag workiq-intent:$TAG ${ACR}/workiq-intent:${TAG}; docker push ${ACR}/workiq-intent:${TAG}
+
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-planner:$TAG -f deploy/Subagents/PlannerSvc/Dockerfile .; docker tag workiq-planner:$TAG ${ACR}/workiq-planner:${TAG}; docker push ${ACR}/workiq-planner:${TAG}
+
+$ACR="acrworkiqincubation-gxf9hfa7bdcgh8dd.azurecr.io"; $TAG=(Get-Date -Format "ddMMyyyyHHmmss"); docker build --platform linux/amd64 -t workiq-citation:$TAG -f deploy/Subagents/CitationSvc/Dockerfile .; docker tag workiq-citation:$TAG ${ACR}/workiq-citation:${TAG}; docker push ${ACR}/workiq-citation:${TAG}
+
+Deploy internal simulator first (planner depends on this):
+az containerapp create ^
+-n workiq-a2a ^
+-g %RG% ^
+--environment %ENV% ^
+--image %ACR%.azurecr.io/workiq-a2a:%TAG% ^
+--target-port 8920 ^
+--ingress internal ^
+--registry-server %ACR%.azurecr.io
+
+Set simulator URL for planner:
+for /f %i in ('az containerapp show -n workiq-a2a -g %RG% --query properties.configuration.ingress.fqdn -o tsv') do set A2A_FQDN=%i
+
+Deploy intent sub-agent (internal):
+az containerapp create ^
+-n workiq-intent ^
+-g %RG% ^
+--environment %ENV% ^
+--image %ACR%.azurecr.io/workiq-intent:%TAG% ^
+--target-port 8930 ^
+--ingress internal ^
+--registry-server %ACR%.azurecr.io ^
+--env-vars ^
+WORKIQ_AZURE_CREDENTIAL_MODE="default" ^
+AZURE_AI_FOUNDRY_ENDPOINT="https://<your-endpoint>/openai/v1" ^
+AZURE_AI_FOUNDRY_DEPLOYMENT="gpt-4o-mini"
+
+Deploy planner sub-agent (internal):
+az containerapp create ^
+-n workiq-planner ^
+-g %RG% ^
+--environment %ENV% ^
+--image %ACR%.azurecr.io/workiq-planner:%TAG% ^
+--target-port 8931 ^
+--ingress internal ^
+--registry-server %ACR%.azurecr.io ^
+--env-vars ^
+WORKIQ_AZURE_CREDENTIAL_MODE="default" ^
+WORKIQ_A2A_CARD="http://%A2A_FQDN%/.well-known/agent-card.json" ^
+WORKIQ_SIM_PERSONA="quality_pm" ^
+AZURE_AI_FOUNDRY_ENDPOINT="https://<your-endpoint>/openai/v1" ^
+AZURE_AI_FOUNDRY_DEPLOYMENT="gpt-4o-mini"
+
+Deploy citation sub-agent (internal):
+az containerapp create ^
+-n workiq-citation ^
+-g %RG% ^
+--environment %ENV% ^
+--image %ACR%.azurecr.io/workiq-citation:%TAG% ^
+--target-port 8932 ^
+--ingress internal ^
+--registry-server %ACR%.azurecr.io ^
+--env-vars ^
+WORKIQ_AZURE_CREDENTIAL_MODE="default" ^
+AZURE_AI_FOUNDRY_ENDPOINT="https://<your-endpoint>/openai/v1" ^
+AZURE_AI_FOUNDRY_DEPLOYMENT="gpt-4o-mini"
+
+Resolve internal URLs and wire web/orchestrator to sub-agents:
+for /f %i in ('az containerapp show -n workiq-intent -g %RG% --query properties.configuration.ingress.fqdn -o tsv') do set INTENT_FQDN=%i
+for /f %i in ('az containerapp show -n workiq-planner -g %RG% --query properties.configuration.ingress.fqdn -o tsv') do set PLANNER_FQDN=%i
+for /f %i in ('az containerapp show -n workiq-citation -g %RG% --query properties.configuration.ingress.fqdn -o tsv') do set CITATION_FQDN=%i
+
+Deploy web app (external) with split-subagent endpoints:
+az containerapp create ^
+-n workiq-web ^
+-g %RG% ^
+--environment %ENV% ^
+--image %ACR%.azurecr.io/workiq-web:%TAG% ^
+--target-port 8000 ^
+--ingress external ^
+--registry-server %ACR%.azurecr.io ^
+--env-vars ^
+WORKIQ_AZURE_CREDENTIAL_MODE="default" ^
+WORKIQ_INTENT_URL="http://%INTENT_FQDN%/a2a/" ^
+WORKIQ_PLANNER_URL="http://%PLANNER_FQDN%/a2a/" ^
+WORKIQ_CITATION_URL="http://%CITATION_FQDN%/a2a/" ^
+AZURE_AI_FOUNDRY_ENDPOINT="https://<your-endpoint>/openai/v1" ^
+AZURE_AI_FOUNDRY_DEPLOYMENT="gpt-4o-mini" ^
+WORKIQ_SIM_PERSONA="quality_pm" ^
+WORKIQ_WEB_AUTH_ENABLED="true" ^
+WORKIQ_WEB_AUTH_CLIENT_ID="<app-registration-client-id>" ^
+WORKIQ_WEB_AUTH_TENANT_ID="<tenant-id>" ^
+WORKIQ_WEB_AUTH_SCOPES="email" ^
+WORKIQ_WEB_AUTH_SECURE_COOKIES="true" ^
+WORKIQ_WEB_AUTH_CLIENT_SECRET=secretref:workiq-auth-client-secret ^
+WORKIQ_WEB_AUTH_SESSION_SECRET=secretref:workiq-auth-session-secret
+
+If workiq-web already exists, update endpoint wiring only:
+az containerapp update ^
+--name workiq-web ^
+--resource-group %RG% ^
+--set-env-vars ^
+WORKIQ_AZURE_CREDENTIAL_MODE="default" ^
+WORKIQ_INTENT_URL="http://%INTENT_FQDN%/a2a/" ^
+WORKIQ_PLANNER_URL="http://%PLANNER_FQDN%/a2a/" ^
+WORKIQ_CITATION_URL="http://%CITATION_FQDN%/a2a/"
+
+Verification commands:
+az containerapp show -n workiq-web -g %RG% --query properties.configuration.ingress.fqdn -o tsv
+az containerapp show -n workiq-a2a -g %RG% --query properties.configuration.ingress.fqdn -o tsv
+az containerapp show -n workiq-intent -g %RG% --query properties.configuration.ingress.fqdn -o tsv
+az containerapp show -n workiq-planner -g %RG% --query properties.configuration.ingress.fqdn -o tsv
+az containerapp show -n workiq-citation -g %RG% --query properties.configuration.ingress.fqdn -o tsv
+
+az containerapp logs show -n workiq-web -g %RG% --follow
+az containerapp logs show -n workiq-intent -g %RG% --follow
+az containerapp logs show -n workiq-planner -g %RG% --follow
+az containerapp logs show -n workiq-citation -g %RG% --follow

@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 
 from openai import AsyncOpenAI
-from azure.identity.aio import AzureCliCredential, get_bearer_token_provider
+from azure.identity.aio import AzureCliCredential, DefaultAzureCredential, get_bearer_token_provider
 
 from agent_framework.openai import OpenAIChatClient
 
@@ -18,6 +18,19 @@ FOUNDRY_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT") or os.environ.get(
     "AZURE_AI_FOUNDRY_ENDPOINT"
 )
 DEFAULT_DEPLOYMENT = os.environ.get("AZURE_AI_FOUNDRY_DEPLOYMENT", "gpt-4o-mini")
+CREDENTIAL_MODE = os.environ.get("WORKIQ_AZURE_CREDENTIAL_MODE", "cli").strip().lower()
+
+
+def _build_credential():
+        """Return an async Azure credential based on runtime mode.
+
+        Modes:
+            - cli (default): deterministic local-dev auth via `az login`
+            - default: cloud-friendly chain (Managed Identity, env creds, etc.)
+        """
+        if CREDENTIAL_MODE == "default":
+                return DefaultAzureCredential()
+        return AzureCliCredential()
 
 
 def build_chat_client(deployment: str | None = None) -> OpenAIChatClient:
@@ -31,7 +44,7 @@ def build_chat_client(deployment: str | None = None) -> OpenAIChatClient:
             "AZURE_OPENAI_ENDPOINT (or AZURE_AI_FOUNDRY_ENDPOINT) is not set. "
             "Point it at your Foundry /openai/v1 endpoint."
         )
-    credential = AzureCliCredential()
+    credential = _build_credential()
     token_provider = get_bearer_token_provider(credential, "https://ai.azure.com/.default")
     openai_client = AsyncOpenAI(
         base_url=FOUNDRY_ENDPOINT,
